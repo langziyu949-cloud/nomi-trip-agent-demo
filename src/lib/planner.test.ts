@@ -67,6 +67,26 @@ describe("buildTripPlan", () => {
     expect(plan.stops[1].eta).toBe("07:55");
   });
 
+  it("多站行程的首站截止时间会保留必要缓冲并尽量晚出发", () => {
+    const intent = makeIntent("ARRIVE_BY");
+    intent.stops = [favoriteDraft("school"), favoriteDraft("wifeCompany"), favoriteDraft("company")];
+    intent.timeConstraints = [
+      { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+    ];
+    intent.timeConstraint = intent.timeConstraints[0];
+    const threeLegs = [
+      makeLeg("home", "school", 29 * 60, 10_000),
+      makeLeg("school", "wifeCompany", 23 * 60, 9_000),
+      makeLeg("wifeCompany", "company", 19 * 60, 8_000),
+    ];
+
+    const plan = buildTripPlan(intent, threeLegs, normalWeather);
+
+    expect(plan.planningBufferSec).toBe(5 * 60);
+    expect(plan.departureTime).toBe("07:26");
+    expect(plan.stops.map((stop) => stop.eta)).toEqual(["07:55", "08:23", "08:47"]);
+  });
+
   it("多个到达约束会倒推出途经点的最晚出发时间", () => {
     const intent = makeIntent("ARRIVE_BY");
     intent.timeConstraints = [

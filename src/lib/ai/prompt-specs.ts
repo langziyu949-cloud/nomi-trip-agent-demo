@@ -4,6 +4,7 @@ import { join } from "node:path";
 const SPEC_FILES = {
   intent: "INTENT_PARSING_SPEC.md",
   narration: "TRIP_NARRATION_SPEC.md",
+  conversation: "CONVERSATION_TURN_SPEC.md",
 } as const;
 
 export type PromptSpecName = keyof typeof SPEC_FILES;

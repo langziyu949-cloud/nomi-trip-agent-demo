@@ -8,11 +8,13 @@ import type { Coordinates, TripPlan } from "@/lib/types";
 
 interface AmapMapProps {
   plan: TripPlan | null;
-  vehiclePosition: Coordinates | null;
-  activeLegIndex: number;
 }
 
 let loaderPromise: Promise<any> | null = null;
+
+function hasValidCoordinates(position: Coordinates | null | undefined): position is Coordinates {
+  return Boolean(position && Number.isFinite(position.lng) && Number.isFinite(position.lat));
+}
 
 function loadAmap(): Promise<any> {
   if (loaderPromise) return loaderPromise;
@@ -36,11 +38,10 @@ function loadAmap(): Promise<any> {
   return loaderPromise;
 }
 
-export function AmapMap({ plan, vehiclePosition, activeLegIndex }: AmapMapProps) {
+export function AmapMap({ plan }: AmapMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
   const amapRef = useRef<any>(null);
-  const vehicleMarkerRef = useRef<any>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "missing" | "error">("loading");
 
   useEffect(() => {
@@ -59,61 +60,77 @@ export function AmapMap({ plan, vehiclePosition, activeLegIndex }: AmapMapProps)
         setStatus("ready");
       })
       .catch((error) => {
+        if (cancelled) return;
         setStatus(error instanceof Error && error.message === "AMAP_CONFIG_MISSING" ? "missing" : "error");
       });
     return () => {
       cancelled = true;
       mapRef.current?.destroy?.();
       mapRef.current = null;
+      amapRef.current = null;
     };
   }, []);
 
   useEffect(() => {
     const AMap = amapRef.current;
     const map = mapRef.current;
-    if (!AMap || !map || !plan) return;
+    if (!AMap || !map || status !== "ready") return;
 
     map.clearMap();
+    if (!plan) return;
+
     const overlays: any[] = [];
-    plan.legs.forEach((leg, index) => {
+
+    plan.legs.forEach((leg) => {
+      const path = leg.polyline
+        .filter(hasValidCoordinates)
+        .map((point) => [point.lng, point.lat]);
+      if (path.length < 2) return;
+
       const polyline = new AMap.Polyline({
-        path: leg.polyline.map((point) => [point.lng, point.lat]),
-        strokeColor: index === activeLegIndex ? "#2d7c70" : "#8db5ad",
-        strokeWeight: index === activeLegIndex ? 8 : 6,
-        strokeOpacity: index === activeLegIndex ? 1 : 0.7,
+        path,
+        strokeColor: "#2d7c70",
+        strokeWeight: 7,
+        strokeOpacity: 0.86,
         lineJoin: "round",
         lineCap: "round",
-        zIndex: index === activeLegIndex ? 30 : 20,
+        zIndex: 20,
       });
       overlays.push(polyline);
     });
 
-    const places = [plan.intent.origin.resolved!, ...plan.intent.stops.map((stop) => stop.resolved!)];
-    places.forEach((place, index) => {
+    const places = [
+      plan.intent.origin.resolved
+        ? { place: plan.intent.origin.resolved, label: "家", isOrigin: true }
+        : null,
+      ...plan.intent.stops.map((stop, index) => stop.resolved
+        ? { place: stop.resolved, label: String(index + 1), isOrigin: false }
+        : null),
+    ].filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+    places.forEach(({ place, label, isOrigin }) => {
+      if (!hasValidCoordinates(place.location)) return;
+
+      const content = document.createElement("div");
+      content.className = `amap-stop-marker${isOrigin ? " is-origin" : ""}`;
+      const markerLabel = document.createElement("span");
+      markerLabel.textContent = label;
+      const markerName = document.createElement("em");
+      markerName.textContent = place.name;
+      content.append(markerLabel, markerName);
+
       const marker = new AMap.Marker({
         position: [place.location.lng, place.location.lat],
         anchor: "center",
-        content: `<div class="amap-stop-marker ${index === 0 ? "is-origin" : ""}"><span>${index === 0 ? "家" : index}</span><em>${place.name}</em></div>`,
+        content,
         zIndex: 40,
       });
       overlays.push(marker);
     });
 
-    vehicleMarkerRef.current = new AMap.Marker({
-      position: [plan.legs[0].polyline[0].lng, plan.legs[0].polyline[0].lat],
-      anchor: "center",
-      content: '<div class="amap-vehicle-marker"><span>➤</span></div>',
-      zIndex: 80,
-    });
-    overlays.push(vehicleMarkerRef.current);
-    map.add(overlays);
-    map.setFitView(overlays.filter((item) => item !== vehicleMarkerRef.current), false, [80, 80, 160, 80], 15);
-  }, [plan, activeLegIndex]);
-
-  useEffect(() => {
-    if (!vehiclePosition || !vehicleMarkerRef.current) return;
-    vehicleMarkerRef.current.setPosition([vehiclePosition.lng, vehiclePosition.lat]);
-  }, [vehiclePosition]);
+    if (overlays.length) map.add(overlays);
+    if (overlays.length) map.setFitView(overlays, false, [80, 80, 160, 80], 15);
+  }, [plan, status]);
 
   return (
     <div className="map-shell">

@@ -148,16 +148,6 @@ export interface PlaceSearchResponse {
   provider: "amap";
 }
 
-export type DemoStage =
-  | "DRAFT"
-  | "PLANNED"
-  | "CONFIRMED"
-  | "PRECONDITIONING"
-  | "READY"
-  | "EN_ROUTE"
-  | "AT_STOP"
-  | "COMPLETED";
-
 export interface ProviderErrorPayload {
   error: string;
   code: string;

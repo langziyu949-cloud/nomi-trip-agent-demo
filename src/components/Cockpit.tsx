@@ -1,25 +1,45 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AmapMap } from "@/components/AmapMap";
+import { ConversationScenario } from "@/components/ConversationScenario";
 import {
   ArrowIcon,
   BatteryIcon,
-  ClockIcon,
   CloseIcon,
-  EditIcon,
   RouteIcon,
   SettingsIcon,
-  SparkIcon,
   WeatherIcon,
 } from "@/components/icons";
-import { formatChineseDate } from "@/lib/date-utils";
+import { conversationPlanFactsFromPlan } from "@/lib/ai/conversation-context";
+import { buildTemplateNarration, type TripNarrationMode } from "@/lib/ai/trip-narrator";
+import type {
+  ConversationPlanFreshness,
+  ConversationTurnResponse,
+} from "@/lib/conversation-turn";
+import {
+  createConversationStore,
+  createMemoryConversationStore,
+  type ConversationPersistence,
+} from "@/lib/conversation-store";
+import {
+  appendConversationMessage,
+  beginConversationTurn,
+  clearPendingConversationIntent,
+  clipRecentMessages,
+  commitConversationPlan,
+  createChatMessage,
+  createEmptyConversation,
+  failConversationTurn,
+  lockConversationScenario,
+  updateConversationTurnStatus,
+  type ChatMessage,
+  type Conversation,
+} from "@/lib/conversations";
 import { DEFAULT_PLACES } from "@/lib/default-places";
 import type {
-  Coordinates,
   DemoSettings,
-  DemoStage,
   FavoritePlaceKey,
   PlaceDraft,
   PlaceSearchResponse,
@@ -31,7 +51,6 @@ import type {
 } from "@/lib/types";
 
 const SAMPLE_PROMPT = "明早 8 点送孩子到学校，然后去公司，提前准备一下。";
-const SIMULATION_DURATION_SEC = 15;
 
 const FAVORITE_PLACE_LABELS: Record<FavoritePlaceKey, string> = {
   home: "家",
@@ -42,7 +61,7 @@ const FAVORITE_PLACE_LABELS: Record<FavoritePlaceKey, string> = {
 
 const FAVORITE_PLACE_KEYS = Object.keys(FAVORITE_PLACE_LABELS) as FavoritePlaceKey[];
 
-const DEFAULT_SETTINGS: DemoSettings = {
+const DEFAULT_SCENARIO: DemoSettings = {
   enabled: false,
   condition: "小雪",
   batteryPercent: 42,
@@ -76,46 +95,15 @@ interface ResolutionTarget {
   query: string;
 }
 
-interface SimulationSnapshot {
-  stage: DemoStage;
-  activeLegIndex: number;
-  position: Coordinates | null;
-  driveProgress: number;
-  arrivedStopIndex: number | null;
-}
-
-function isFavoritePlaceKey(value: string): value is FavoritePlaceKey {
-  return FAVORITE_PLACE_KEYS.includes(value as FavoritePlaceKey);
-}
-
-function normalizeSettings(value: Partial<DemoSettings> | null): DemoSettings {
-  const legacyTemperature = (value as Partial<DemoSettings> & { temperatureC?: number } | null)?.temperatureC;
-  return {
-    ...DEFAULT_SETTINGS,
-    ...value,
-    cabinTemperatureC: value?.cabinTemperatureC ?? legacyTemperature ?? DEFAULT_SETTINGS.cabinTemperatureC,
-    preconditionVehicle: value?.preconditionVehicle ?? true,
-    favoritePlaces: {
-      ...DEFAULT_PLACES,
-      ...(value?.favoritePlaces ?? {}),
-    },
-  };
-}
-
-function applySettingsToIntent(intent: TripIntentDraft, settings: DemoSettings): TripIntentDraft {
-  const next = structuredClone(intent);
-  const applyFavorite = (place: PlaceDraft) => {
-    if (!isFavoritePlaceKey(place.key)) return;
-    place.resolved = settings.favoritePlaces[place.key];
-    place.label = FAVORITE_PLACE_LABELS[place.key];
-    place.query = FAVORITE_PLACE_LABELS[place.key];
-  };
-  applyFavorite(next.origin);
-  next.stops.forEach(applyFavorite);
-  next.preferences = settings.preconditionVehicle
-    ? [...new Set([...next.preferences, "precondition_vehicle"])]
-    : next.preferences.filter((item) => item !== "precondition_vehicle");
-  return next;
+interface PendingResolution {
+  conversationId: string;
+  turnId: string;
+  assistantMessageId: string;
+  intent: TripIntentDraft;
+  target: ResolutionTarget;
+  candidates: ResolvedPlace[];
+  searching: boolean;
+  searchError: string;
 }
 
 class ApiError extends Error {
@@ -130,12 +118,48 @@ class ApiError extends Error {
 
 async function fetchJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
-  const body = (await response.json()) as T | ProviderErrorPayload;
+  const body = (await response.json().catch(() => null)) as T | ProviderErrorPayload | null;
   if (!response.ok) {
-    const error = body as ProviderErrorPayload;
-    throw new ApiError(error.error ?? "请求失败，请稍后重试。", error.code, error.retryable);
+    const error = body as ProviderErrorPayload | null;
+    throw new ApiError(error?.error ?? "请求失败，请稍后重试。", error?.code, error?.retryable);
   }
   return body as T;
+}
+
+function newId(prefix: string): string {
+  const value = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${value}`;
+}
+
+function cloneDefaultScenario(): DemoSettings {
+  return structuredClone(DEFAULT_SCENARIO);
+}
+
+function isFavoritePlaceKey(value: string): value is FavoritePlaceKey {
+  return FAVORITE_PLACE_KEYS.includes(value as FavoritePlaceKey);
+}
+
+function applyScenarioToIntent(
+  intent: TripIntentDraft,
+  scenario: DemoSettings,
+  applyPreconditionDefault: boolean,
+): TripIntentDraft {
+  const next = structuredClone(intent);
+  const applyFavorite = (place: PlaceDraft) => {
+    if (!isFavoritePlaceKey(place.key)) return;
+    place.resolved = structuredClone(scenario.favoritePlaces[place.key]);
+    place.label = FAVORITE_PLACE_LABELS[place.key];
+    place.query = FAVORITE_PLACE_LABELS[place.key];
+  };
+  applyFavorite(next.origin);
+  next.stops.forEach(applyFavorite);
+  if (!scenario.preconditionVehicle) {
+    next.preferences = next.preferences.filter((item) => item !== "precondition_vehicle");
+  } else if (applyPreconditionDefault) {
+    next.preferences = [...new Set([...next.preferences, "precondition_vehicle"])];
+  }
+  return next;
 }
 
 function findUnresolved(intent: TripIntentDraft): ResolutionTarget | null {
@@ -143,29 +167,9 @@ function findUnresolved(intent: TripIntentDraft): ResolutionTarget | null {
     return { type: "origin", index: -1, query: intent.origin.query };
   }
   const index = intent.stops.findIndex((stop) => !stop.resolved);
-  if (index >= 0) return { type: "stop", index, query: intent.stops[index].query };
-  return null;
-}
-
-function updatePlaceDraft(place: PlaceDraft, query: string): PlaceDraft {
-  if (place.resolved && query === place.resolved.name) return { ...place, query, label: query };
-  return {
-    ...place,
-    key: `custom-${Date.now()}-${query}`,
-    label: query,
-    query,
-    resolved: null,
-  };
-}
-
-function updatePrimaryTimeConstraint(
-  draft: TripIntentDraft,
-  updater: (constraint: TripIntentDraft["timeConstraint"]) => void,
-) {
-  updater(draft.timeConstraint);
-  if (draft.timeConstraints?.length) {
-    draft.timeConstraints[draft.timeConstraints.length - 1] = { ...draft.timeConstraint };
-  }
+  return index >= 0
+    ? { type: "stop", index, query: intent.stops[index].query }
+    : null;
 }
 
 function formatDuration(seconds: number): string {
@@ -180,95 +184,6 @@ function formatDistance(meters: number): string {
   return meters < 1000 ? `${Math.round(meters)} m` : `${(meters / 1000).toFixed(1)} km`;
 }
 
-function interpolate(points: Coordinates[], progress: number): Coordinates | null {
-  if (points.length === 0) return null;
-  if (points.length === 1) return points[0];
-  const value = Math.min(1, Math.max(0, progress)) * (points.length - 1);
-  const index = Math.min(points.length - 2, Math.floor(value));
-  const local = value - index;
-  return {
-    lng: points[index].lng + (points[index + 1].lng - points[index].lng) * local,
-    lat: points[index].lat + (points[index + 1].lat - points[index].lat) * local,
-  };
-}
-
-function getSimulationSnapshot(plan: TripPlan | null, progress: number): SimulationSnapshot {
-  if (!plan) return { stage: "DRAFT", activeLegIndex: 0, position: null, driveProgress: 0, arrivedStopIndex: null };
-  const first = plan.legs[0]?.polyline[0] ?? plan.intent.origin.resolved?.location ?? null;
-  if (progress <= 0) return { stage: "CONFIRMED", activeLegIndex: 0, position: first, driveProgress: 0, arrivedStopIndex: null };
-  const hasPreparationAction = plan.actions.some((item) =>
-    ["PREHEAT", "PRECOOL", "SEAT_HEAT", "DEFOG"].includes(item.type),
-  );
-  if (progress < 0.16) return { stage: hasPreparationAction ? "PRECONDITIONING" : "CONFIRMED", activeLegIndex: 0, position: first, driveProgress: 0, arrivedStopIndex: null };
-  if (progress < 0.24) return { stage: "READY", activeLegIndex: 0, position: first, driveProgress: 0, arrivedStopIndex: null };
-  if (progress >= 0.96) {
-    const lastLeg = plan.legs.at(-1);
-    return {
-      stage: "COMPLETED",
-      activeLegIndex: Math.max(0, plan.legs.length - 1),
-      position: lastLeg?.polyline.at(-1) ?? lastLeg?.to.location ?? first,
-      driveProgress: 1,
-      arrivedStopIndex: plan.legs.length - 1,
-    };
-  }
-
-  const driveProgress = Math.min(1, Math.max(0, (progress - 0.24) / 0.72));
-  const totalRouteDuration = plan.legs.reduce((sum, leg) => sum + Math.max(1, leg.durationSec), 0);
-  const targetDuration = driveProgress * totalRouteDuration;
-  let elapsed = 0;
-  let activeLegIndex = 0;
-  let localProgress = 0;
-  for (let index = 0; index < plan.legs.length; index += 1) {
-    const duration = Math.max(1, plan.legs[index].durationSec);
-    if (targetDuration <= elapsed + duration || index === plan.legs.length - 1) {
-      activeLegIndex = index;
-      localProgress = Math.min(1, Math.max(0, (targetDuration - elapsed) / duration));
-      break;
-    }
-    elapsed += duration;
-  }
-  const isAtIntermediateStop = localProgress > 0.94 && activeLegIndex < plan.legs.length - 1;
-  return {
-    stage: isAtIntermediateStop ? "AT_STOP" : "EN_ROUTE",
-    activeLegIndex,
-    position: interpolate(plan.legs[activeLegIndex].polyline, localProgress),
-    driveProgress,
-    arrivedStopIndex: isAtIntermediateStop ? activeLegIndex : null,
-  };
-}
-
-function getSimulatedTime(plan: TripPlan | null, progress: number | null): Date | null {
-  if (!plan || progress === null) return null;
-  const departureMs = new Date(plan.departureAt).getTime();
-  const finalArrivalMs = plan.stops.at(-1)?.dateTime
-    ? new Date(plan.stops.at(-1)!.dateTime).getTime()
-    : departureMs + plan.totalDurationSec * 1000;
-  const scheduledTimes = plan.actions
-    .flatMap((item) => item.scheduledAt ? [new Date(item.scheduledAt).getTime()] : [])
-    .filter(Number.isFinite);
-  const preparationStartMs = scheduledTimes.length
-    ? Math.min(departureMs, ...scheduledTimes)
-    : departureMs;
-
-  if (progress <= 0.24) {
-    const prepProgress = Math.max(0, progress) / 0.24;
-    return new Date(preparationStartMs + (departureMs - preparationStartMs) * prepProgress);
-  }
-  const routeProgress = Math.min(1, Math.max(0, (progress - 0.24) / 0.72));
-  return new Date(departureMs + (finalArrivalMs - departureMs) * routeProgress);
-}
-
-const STAGE_LABELS: Record<DemoStage, string> = {
-  DRAFT: "等待规划",
-  PLANNED: "计划已生成",
-  CONFIRMED: "行程已确认",
-  PRECONDITIONING: "正在准备座舱",
-  READY: "车辆已就绪",
-  EN_ROUTE: "导航进行中",
-  AT_STOP: "已到达途经点",
-  COMPLETED: "行程已完成",
-};
-
 function NomiOrb({ active }: { active: boolean }) {
   return (
     <div className={`nomi-orb ${active ? "is-active" : ""}`} aria-hidden="true">
@@ -278,356 +193,961 @@ function NomiOrb({ active }: { active: boolean }) {
   );
 }
 
+function recoverInterruptedConversation(conversation: Conversation): Conversation {
+  const interrupted = ["pending", "resolving_places", "planning", "answering"].includes(conversation.turn.status);
+  if (!interrupted) return conversation;
+  const timestamp = new Date().toISOString();
+  let lastAssistantIndex = -1;
+  for (let index = 0; index < conversation.messages.length; index += 1) {
+    const message = conversation.messages[index];
+    if (message.turnId === conversation.turn.turnId && message.role === "assistant") {
+      lastAssistantIndex = index;
+    }
+  }
+  return {
+    ...conversation,
+    updatedAt: timestamp,
+    messages: conversation.messages.map((message, index) => (
+      message.status === "pending"
+      || (conversation.turn.status === "resolving_places" && index === lastAssistantIndex)
+    )
+      ? {
+          ...message,
+          kind: "error" as const,
+          status: "failed" as const,
+          content: "上次请求在页面关闭时中断了，你可以重新发送这条需求。",
+        }
+      : message),
+    trip: { ...conversation.trip, pendingIntent: null },
+    turn: {
+      ...conversation.turn,
+      status: "failed",
+      updatedAt: timestamp,
+      error: { message: "上次请求已中断。", code: "TURN_INTERRUPTED", retryable: true },
+    },
+  };
+}
+
+function replaceMessage(
+  conversation: Conversation,
+  messageId: string,
+  updater: (message: ChatMessage) => ChatMessage,
+): Conversation {
+  const timestamp = new Date().toISOString();
+  return {
+    ...conversation,
+    updatedAt: timestamp,
+    messages: conversation.messages.map((message) => message.id === messageId ? updater(message) : message),
+  };
+}
+
+function narrationRequestBody(plan: TripPlan, mode: TripNarrationMode) {
+  return {
+    userText: plan.intent.rawText,
+    mode,
+    plan: {
+      intent: {
+        date: plan.intent.date,
+        origin: {
+          label: plan.intent.origin.label,
+          query: plan.intent.origin.query,
+          resolved: plan.intent.origin.resolved ? { name: plan.intent.origin.resolved.name } : null,
+        },
+        stops: plan.intent.stops.map((stop) => ({
+          label: stop.label,
+          query: stop.query,
+        })),
+        timeConstraint: plan.intent.timeConstraint,
+        timeConstraints: plan.intent.timeConstraints,
+      },
+      departureTime: plan.departureTime,
+      planningBufferSec: plan.planningBufferSec,
+      stops: plan.stops.map((stop) => ({
+        place: { name: stop.place.name },
+        eta: stop.eta,
+        dateTime: stop.dateTime,
+        departureTime: stop.departureTime ?? null,
+        dwellSec: stop.dwellSec ?? 0,
+      })),
+      weather: {
+        available: plan.weather.available,
+        condition: plan.weather.condition,
+        temperatureC: plan.weather.temperatureC,
+        source: plan.weather.source,
+      },
+      vehicle: {
+        batteryPercent: plan.vehicle.batteryPercent,
+        estimatedArrivalBattery: plan.vehicle.estimatedArrivalBattery,
+        cabinTemperatureC: plan.vehicle.cabinTemperatureC,
+      },
+      actions: plan.actions.map((action) => ({
+        type: action.type,
+        title: action.title,
+        detail: action.detail,
+        severity: action.severity,
+        scheduledAt: action.scheduledAt,
+      })),
+    },
+  };
+}
+
+function historyTime(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Shanghai",
+  }).format(date);
+}
+
 export function Cockpit() {
-  const [prompt, setPrompt] = useState(SAMPLE_PROMPT);
-  const [intent, setIntent] = useState<TripIntentDraft | null>(null);
-  const [plan, setPlan] = useState<TripPlan | null>(null);
-  const [narration, setNarration] = useState<TripNarrationResponse | null>(null);
-  const [narrating, setNarrating] = useState(false);
-  const [isEditing, setIsEditing] = useState(false);
-  const [loading, setLoading] = useState<"parse" | "places" | "plan" | null>(null);
-  const [error, setError] = useState<ApiError | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [showLab, setShowLab] = useState(false);
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-  const [resolution, setResolution] = useState<ResolutionTarget | null>(null);
-  const [candidates, setCandidates] = useState<ResolvedPlace[]>([]);
-  const [simulationProgress, setSimulationProgress] = useState<number | null>(null);
-  const animationRef = useRef<number | null>(null);
-  const narrationRequestRef = useRef(0);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState("");
+  const [hydrated, setHydrated] = useState(false);
+  const [storageWarning, setStorageWarning] = useState("");
+  const [composer, setComposer] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [scenarioViewOpen, setScenarioViewOpen] = useState(false);
+  const [scenarioDrafts, setScenarioDrafts] = useState<Record<string, DemoSettings>>({});
+  const [resolutions, setResolutions] = useState<Record<string, PendingResolution>>({});
+  const storeRef = useRef<ConversationPersistence | null>(null);
+  const persistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const conversationsRef = useRef<Conversation[]>([]);
+  const messageListRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+
+  const mutateConversation = (id: string, updater: (conversation: Conversation) => Conversation) => {
+    const next = conversationsRef.current.map((conversation) =>
+      conversation.id === id ? updater(conversation) : conversation,
+    );
+    conversationsRef.current = next;
+    setConversations(next);
+  };
+
+  const conversationById = (id: string): Conversation | null =>
+    conversationsRef.current.find((conversation) => conversation.id === id) ?? null;
 
   useEffect(() => {
     fetchJson<HealthResponse>("/api/providers/health").then(setHealth).catch(() => setHealth(null));
-    const restoreStorage = window.setTimeout(() => {
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const hydrate = async () => {
+      const persistentStore = createConversationStore({ defaultDemoSettings: DEFAULT_SCENARIO });
+      let store: ConversationPersistence = persistentStore;
+      let loaded: Conversation[] = [];
+      let restoredActiveId: string | null = null;
+      let persistenceWarning = "";
       try {
-        const savedIntent = window.localStorage.getItem("nomi-demo-intent");
-        const savedPlan = window.localStorage.getItem("nomi-demo-plan");
-        const savedOverrides = window.localStorage.getItem("nomi-demo-overrides");
-        if (savedIntent) setIntent(JSON.parse(savedIntent) as TripIntentDraft);
-        if (savedPlan) setPlan(JSON.parse(savedPlan) as TripPlan);
-        if (savedOverrides) setSettings(normalizeSettings(JSON.parse(savedOverrides) as Partial<DemoSettings>));
-      } catch {
-        window.localStorage.removeItem("nomi-demo-plan");
-        window.localStorage.removeItem("nomi-demo-intent");
+        await persistentStore.migrateLegacyConversation({ defaultDemoSettings: DEFAULT_SCENARIO });
+      } catch (error) {
+        persistenceWarning = error instanceof Error
+          ? error.message
+          : "旧版行程暂未迁移，原记录已保留。";
       }
-    }, 0);
+      try {
+        [loaded, restoredActiveId] = await Promise.all([
+          persistentStore.loadConversations(),
+          persistentStore.getActiveConversationId(),
+        ]);
+      } catch (error) {
+        persistentStore.close();
+        store = createMemoryConversationStore();
+        persistenceWarning = error instanceof Error
+          ? error.message
+          : "历史暂未保存，本页内仍可继续使用。";
+      }
+      if (cancelled) {
+        store.close();
+        return;
+      }
+
+      if (persistenceWarning) setStorageWarning(persistenceWarning);
+
+      loaded = loaded.map(recoverInterruptedConversation);
+      if (loaded.length === 0) loaded = [createEmptyConversation()];
+      if (!restoredActiveId || !loaded.some((conversation) => conversation.id === restoredActiveId)) {
+        restoredActiveId = loaded[0].id;
+      }
+      storeRef.current = store;
+      conversationsRef.current = loaded;
+      setConversations(loaded);
+      setActiveConversationId(restoredActiveId);
+      setScenarioDrafts(Object.fromEntries(
+        loaded
+          .filter((conversation) => !conversation.scenario.ready)
+          .map((conversation) => [conversation.id, cloneDefaultScenario()]),
+      ));
+      setHydrated(true);
+    };
+    void hydrate();
     return () => {
-      window.clearTimeout(restoreStorage);
+      cancelled = true;
+      storeRef.current?.close();
+      storeRef.current = null;
     };
   }, []);
 
   useEffect(() => {
-    if (intent) window.localStorage.setItem("nomi-demo-intent", JSON.stringify(intent));
-  }, [intent]);
+    if (!hydrated || !storeRef.current) return;
+    const store = storeRef.current;
+    const snapshot = structuredClone(conversations);
+    persistenceQueueRef.current = persistenceQueueRef.current
+      .catch(() => undefined)
+      .then(() => store.saveConversations(snapshot))
+      .catch((error) => {
+        setStorageWarning(error instanceof Error ? error.message : "历史暂未保存，本页内仍可继续使用。");
+      });
+  }, [conversations, hydrated]);
 
   useEffect(() => {
-    if (plan) window.localStorage.setItem("nomi-demo-plan", JSON.stringify(plan));
-  }, [plan]);
+    if (!hydrated || !activeConversationId || !storeRef.current) return;
+    storeRef.current.setActiveConversationId(activeConversationId).catch((error) => {
+      setStorageWarning(error instanceof Error ? error.message : "当前会话暂未保存。");
+    });
+  }, [activeConversationId, hydrated]);
+
+  const activeConversation = useMemo(
+    () => conversations.find((conversation) => conversation.id === activeConversationId) ?? conversations[0] ?? null,
+    [activeConversationId, conversations],
+  );
+  const activePlan = activeConversation?.trip.currentPlan ?? null;
+  const activeScenario = activeConversation?.scenario.demoSettings ?? null;
+  const activeResolution = activeConversation ? resolutions[activeConversation.id] ?? null : null;
 
   useEffect(() => {
-    window.localStorage.setItem("nomi-demo-overrides", JSON.stringify(settings));
-  }, [settings]);
+    const container = messageListRef.current;
+    if (!container || historyOpen || scenarioViewOpen) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+  }, [activeConversation?.messages, historyOpen, scenarioViewOpen]);
 
-  const requestNarration = useCallback(async (tripPlan: TripPlan) => {
-    const requestId = narrationRequestRef.current + 1;
-    narrationRequestRef.current = requestId;
-    setNarration(null);
-    setNarrating(true);
-    try {
-      const result = await fetchJson<TripNarrationResponse>("/api/trips/narrate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          plan: {
-            intent: {
-              date: tripPlan.intent.date,
-              origin: {
-                query: tripPlan.intent.origin.query,
-                resolved: tripPlan.intent.origin.resolved
-                  ? { name: tripPlan.intent.origin.resolved.name }
-                  : null,
-              },
-            },
-            departureTime: tripPlan.departureTime,
-            planningBufferSec: tripPlan.planningBufferSec,
-            stops: tripPlan.stops.map((stop) => ({
-              place: { name: stop.place.name },
-              eta: stop.eta,
-              departureTime: stop.departureTime ?? null,
-              dwellSec: stop.dwellSec ?? 0,
-            })),
-            weather: {
-              available: tripPlan.weather.available,
-              condition: tripPlan.weather.condition,
-              temperatureC: tripPlan.weather.temperatureC,
-              source: tripPlan.weather.source,
-            },
-            vehicle: {
-              batteryPercent: tripPlan.vehicle.batteryPercent,
-              estimatedArrivalBattery: tripPlan.vehicle.estimatedArrivalBattery,
-              cabinTemperatureC: tripPlan.vehicle.cabinTemperatureC,
-            },
-            actions: tripPlan.actions.map((action) => ({
-              type: action.type,
-              title: action.title,
-              detail: action.detail,
-              severity: action.severity,
-              scheduledAt: action.scheduledAt,
-            })),
-          },
-        }),
+  const currentBattery = activePlan
+    ? activePlan.vehicle.batteryPercent
+    : activeScenario?.batteryPercent ?? DEFAULT_SCENARIO.batteryPercent;
+
+  const failTurn = (
+    conversationId: string,
+    turnId: string,
+    assistantMessageId: string,
+    error: unknown,
+  ) => {
+    const apiError = error instanceof ApiError
+      ? error
+      : new ApiError(error instanceof Error ? error.message : "这次没有处理成功，请稍后重试。");
+    setResolutions((current) => {
+      const next = { ...current };
+      delete next[conversationId];
+      return next;
+    });
+    mutateConversation(conversationId, (conversation) => {
+      if (conversation.turn.turnId !== turnId) return conversation;
+      let next = failConversationTurn(conversation, {
+        turnId,
+        error: { message: apiError.message, code: apiError.code, retryable: apiError.retryable },
       });
-      if (narrationRequestRef.current === requestId) setNarration(result);
-    } catch {
-      // The deterministic in-page template remains available when narration fails.
-      if (narrationRequestRef.current === requestId) setNarration(null);
-    } finally {
-      if (narrationRequestRef.current === requestId) setNarrating(false);
-    }
-  }, []);
+      next = clearPendingConversationIntent(next);
+      return replaceMessage(next, assistantMessageId, (message) => ({
+        ...message,
+        kind: "error",
+        status: "failed",
+        content: apiError.message,
+      }));
+    });
+  };
 
-  const requestPlan = useCallback(async (readyIntent: TripIntentDraft) => {
-    const configuredIntent = applySettingsToIntent(readyIntent, settings);
-    setLoading("plan");
-    setError(null);
+  const finishAssistantMessage = (
+    conversationId: string,
+    turnId: string,
+    assistantMessageId: string,
+    content: string,
+    kind: ChatMessage["kind"] = "text",
+    planId: string | null = null,
+  ) => {
+    mutateConversation(conversationId, (conversation) => {
+      if (conversation.turn.turnId !== turnId) return conversation;
+      let next = updateConversationTurnStatus(conversation, turnId, "complete");
+      next = replaceMessage(next, assistantMessageId, (message) => ({
+        ...message,
+        kind,
+        status: "complete",
+        planId,
+        content,
+      }));
+      return next;
+    });
+  };
+
+  const requestPlan = async (intent: TripIntentDraft, scenario: DemoSettings): Promise<TripPlan> =>
+    fetchJson<TripPlan>("/api/trips/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ intent, overrides: scenario }),
+    });
+
+  const executePlan = async (
+    conversationId: string,
+    turnId: string,
+    assistantMessageId: string,
+    inputIntent: TripIntentDraft,
+  ) => {
+    const conversation = conversationById(conversationId);
+    const scenario = conversation?.scenario.demoSettings;
+    if (!conversation || !scenario) {
+      failTurn(conversationId, turnId, assistantMessageId, new ApiError("请先设置并锁定本次对话的 Demo Lab 场景。", "SCENARIO_REQUIRED", false));
+      return;
+    }
+    const intent = applyScenarioToIntent(inputIntent, scenario, conversation.trip.currentPlan === null);
+    mutateConversation(conversationId, (current) => {
+      if (current.turn.turnId !== turnId) return current;
+      const next = updateConversationTurnStatus(current, turnId, "planning");
+      return replaceMessage(next, assistantMessageId, (message) => ({
+        ...message,
+        status: "pending",
+        content: "正在结合路线、天气和本次对话的车况场景…",
+      }));
+    });
+
     try {
-      const result = await fetchJson<TripPlan>("/api/trips/plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ intent: configuredIntent, overrides: settings }),
+      const narrationMode: TripNarrationMode = conversation.trip.currentPlan ? "update" : "initial";
+      const plan = await requestPlan(intent, scenario);
+      mutateConversation(conversationId, (current) => {
+        if (current.turn.turnId !== turnId) return current;
+        let next = commitConversationPlan(current, { turnId, intent, plan });
+        next = updateConversationTurnStatus(next, turnId, "answering");
+        return replaceMessage(next, assistantMessageId, (message) => ({
+          ...message,
+          status: "pending",
+          content: "路线已经更新，正在整理成一条清晰的回复…",
+        }));
       });
-      setIntent(configuredIntent);
-      setPlan(result);
-      setIsEditing(false);
-      setSimulationProgress(null);
-      void requestNarration(result);
-    } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError : new ApiError("生成计划失败。"));
-      setIsEditing(true);
-    } finally {
-      setLoading(null);
-    }
-  }, [requestNarration, settings]);
 
-  const resolveOrPlan = useCallback(async (nextIntent: TripIntentDraft) => {
-    setIntent(nextIntent);
-    const unresolved = findUnresolved(nextIntent);
-    if (!unresolved) {
-      if (nextIntent.stops.length === 0) {
-        setError(new ApiError("请至少添加一个目的地。", "NO_STOPS", false));
-        setIsEditing(true);
-        return;
+      let narrationText = buildTemplateNarration(plan, {
+        context: { userText: plan.intent.rawText, mode: narrationMode },
+      }).text;
+      try {
+        const narration = await fetchJson<TripNarrationResponse>("/api/trips/narrate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(narrationRequestBody(plan, narrationMode)),
+        });
+        narrationText = narration.text;
+      } catch {
+        // The deterministic text above keeps a successful route usable.
       }
-      await requestPlan(nextIntent);
-      return;
-    }
-    if (!unresolved.query.trim()) {
-      setError(new ApiError("请填写需要搜索的地点名称。", "EMPTY_PLACE", false));
-      setIsEditing(true);
-      return;
-    }
-    setLoading("places");
-    setError(null);
-    try {
-      const result = await fetchJson<PlaceSearchResponse>(
-        `/api/places/search?q=${encodeURIComponent(unresolved.query)}&city=${encodeURIComponent(nextIntent.city)}`,
-      );
-      setResolution(unresolved);
-      setCandidates(result.candidates);
-    } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError : new ApiError("地点搜索失败。"));
-      setIsEditing(true);
-    } finally {
-      setLoading(null);
-    }
-  }, [requestPlan]);
-
-  const analyzePrompt = async () => {
-    if (!prompt.trim()) return;
-    setLoading("parse");
-    setError(null);
-    setIntent(null);
-    setPlan(null);
-    setNarration(null);
-    window.localStorage.removeItem("nomi-demo-intent");
-    window.localStorage.removeItem("nomi-demo-plan");
-    narrationRequestRef.current += 1;
-    setNarrating(false);
-    setSimulationProgress(null);
-    try {
-      const rawParsed = await fetchJson<TripIntentDraft>("/api/intents/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: prompt }),
-      });
-      const parsed = applySettingsToIntent(rawParsed, settings);
-      setIntent(parsed);
-      setIsEditing(parsed.issues.length > 0 || parsed.stops.length === 0);
-      if (parsed.stops.length > 0 && parsed.issues.length === 0) await resolveOrPlan(parsed);
-    } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError : new ApiError("自然语言解析失败。"));
-    } finally {
-      setLoading((current) => (current === "parse" ? null : current));
+      finishAssistantMessage(conversationId, turnId, assistantMessageId, narrationText, "plan", plan.id);
+    } catch (error) {
+      failTurn(conversationId, turnId, assistantMessageId, error);
     }
   };
 
-  const chooseCandidate = async (place: ResolvedPlace) => {
-    if (!intent || !resolution) return;
+  const resolveOrPlan = async (
+    conversationId: string,
+    turnId: string,
+    assistantMessageId: string,
+    inputIntent: TripIntentDraft,
+  ) => {
+    const conversation = conversationById(conversationId);
+    const scenario = conversation?.scenario.demoSettings;
+    if (!conversation || !scenario) {
+      failTurn(conversationId, turnId, assistantMessageId, new ApiError("请先设置本次对话场景。", "SCENARIO_REQUIRED", false));
+      return;
+    }
+    const intent = applyScenarioToIntent(inputIntent, scenario, conversation.trip.currentPlan === null);
+    if (intent.stops.length === 0 || intent.issues.length > 0) {
+      mutateConversation(conversationId, (current) => {
+        if (current.turn.turnId !== turnId) return current;
+        const timestamp = new Date().toISOString();
+        let next: Conversation = {
+          ...current,
+          trip: { ...current.trip, pendingIntent: intent },
+          turn: { ...current.turn, status: "complete", updatedAt: timestamp },
+        };
+        next = replaceMessage(next, assistantMessageId, (message) => ({
+          ...message,
+          kind: "clarification",
+          status: "complete",
+          content: intent.issues[0] ?? "我还缺少目的地，请告诉我这次要去哪里。",
+        }));
+        return next;
+      });
+      return;
+    }
+
+    const unresolved = findUnresolved(intent);
+    if (!unresolved) {
+      await executePlan(conversationId, turnId, assistantMessageId, intent);
+      return;
+    }
+    if (!unresolved.query.trim()) {
+      failTurn(conversationId, turnId, assistantMessageId, new ApiError("请告诉我需要搜索的地点名称。", "EMPTY_PLACE", false));
+      return;
+    }
+
+    mutateConversation(conversationId, (current) => {
+      if (current.turn.turnId !== turnId) return current;
+      const next = updateConversationTurnStatus(current, turnId, "resolving_places");
+      return {
+        ...replaceMessage(next, assistantMessageId, (message) => ({
+          ...message,
+          status: "pending",
+          content: `正在确认“${unresolved.query}”的具体地点…`,
+        })),
+        trip: { ...next.trip, pendingIntent: intent },
+      };
+    });
+
+    try {
+      const result = await fetchJson<PlaceSearchResponse>(
+        `/api/places/search?q=${encodeURIComponent(unresolved.query)}&city=${encodeURIComponent(intent.city)}`,
+      );
+      const resolution: PendingResolution = {
+        conversationId,
+        turnId,
+        assistantMessageId,
+        intent,
+        target: unresolved,
+        candidates: result.candidates,
+        searching: false,
+        searchError: "",
+      };
+      setResolutions((current) => ({ ...current, [conversationId]: resolution }));
+      mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
+        ? current
+        : replaceMessage(current, assistantMessageId, (message) => ({
+            ...message,
+            kind: "clarification",
+            status: "complete",
+            content: `你指的是哪个“${unresolved.query}”？选择后我再继续规划。`,
+          })));
+    } catch (error) {
+      failTurn(conversationId, turnId, assistantMessageId, error);
+    }
+  };
+
+  const performRefreshForQuestion = async (
+    conversationId: string,
+    turnId: string,
+    assistantMessageId: string,
+    userText: string,
+    depth: number,
+  ) => {
+    const conversation = conversationById(conversationId);
+    const intent = conversation?.trip.currentIntent;
+    const scenario = conversation?.scenario.demoSettings;
+    if (!conversation || !intent || !scenario || depth > 0) {
+      failTurn(conversationId, turnId, assistantMessageId, new ApiError("当前没有可以刷新的有效行程。", "REFRESH_UNAVAILABLE", false));
+      return;
+    }
+    mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
+      ? current
+      : replaceMessage(
+          updateConversationTurnStatus(current, turnId, "planning"),
+          assistantMessageId,
+          (message) => ({ ...message, status: "pending", content: "正在刷新路线和天气…" }),
+        ));
+    try {
+      const plan = await requestPlan(intent, scenario);
+      mutateConversation(conversationId, (current) => {
+        if (current.turn.turnId !== turnId) return current;
+        return {
+          ...current,
+          turn: { ...current.turn, status: "answering", updatedAt: new Date().toISOString() },
+        };
+      });
+      await runConversationTurn(
+        conversationId,
+        turnId,
+        assistantMessageId,
+        userText,
+        { status: "FRESH", updatedAt: plan.createdAt, refreshedForTurnId: turnId },
+        plan,
+        depth + 1,
+      );
+    } catch (error) {
+      failTurn(conversationId, turnId, assistantMessageId, error);
+    }
+  };
+
+  const runConversationTurn = async (
+    conversationId: string,
+    turnId: string,
+    assistantMessageId: string,
+    userText: string,
+    freshnessOverride?: ConversationPlanFreshness,
+    planOverride?: TripPlan,
+    refreshDepth = 0,
+  ) => {
+    const conversation = conversationById(conversationId);
+    if (!conversation || conversation.turn.turnId !== turnId) return;
+    const plan = planOverride ?? conversation.trip.currentPlan;
+    const history = clipRecentMessages(
+      conversation.messages.filter((message) => message.status === "complete" && message.content.trim()),
+    ).map((message) => ({ role: message.role, content: message.content }));
+    const freshness: ConversationPlanFreshness = freshnessOverride ?? (plan
+      ? { status: "SNAPSHOT", updatedAt: conversation.trip.planUpdatedAt ?? plan.createdAt }
+      : { status: "MISSING", updatedAt: null });
+
+    try {
+      const response = await fetchJson<ConversationTurnResponse>("/api/conversations/turn", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          conversationId,
+          turnId,
+          text: userText,
+          currentIntent: conversation.trip.currentIntent,
+          pendingIntent: conversation.trip.pendingIntent,
+          planFacts: plan ? conversationPlanFactsFromPlan(plan) : null,
+          planFreshness: freshness,
+          history,
+        }),
+      });
+      if (response.conversationId !== conversationId || response.turnId !== turnId) {
+        throw new ApiError("服务返回了不匹配的会话结果。", "TURN_MISMATCH", true);
+      }
+      if (response.type === "ANSWER") {
+        if (
+          planOverride
+          && freshnessOverride?.status === "FRESH"
+          && freshnessOverride.refreshedForTurnId === turnId
+        ) {
+          mutateConversation(conversationId, (current) => {
+            if (current.turn.turnId !== turnId) return current;
+            const next = commitConversationPlan(current, {
+              turnId,
+              intent: planOverride.intent,
+              plan: planOverride,
+            });
+            return replaceMessage(next, assistantMessageId, (message) => ({
+              ...message,
+              kind: "plan",
+              status: "complete",
+              planId: planOverride.id,
+              content: response.text,
+            }));
+          });
+        } else {
+          finishAssistantMessage(conversationId, turnId, assistantMessageId, response.text);
+        }
+      } else if (response.type === "CLARIFY") {
+        if (response.intent) {
+          mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
+            ? current
+            : { ...current, trip: { ...current.trip, pendingIntent: response.intent ?? null } });
+        }
+        finishAssistantMessage(conversationId, turnId, assistantMessageId, response.text, "clarification");
+      } else if (response.type === "REFRESH_REQUIRED") {
+        await performRefreshForQuestion(
+          conversationId,
+          turnId,
+          assistantMessageId,
+          userText,
+          refreshDepth,
+        );
+      } else {
+        const currentScenario = conversationById(conversationId)?.scenario.demoSettings;
+        if (
+          currentScenario
+          && !currentScenario.preconditionVehicle
+          && response.intent.preferences.includes("precondition_vehicle")
+        ) {
+          finishAssistantMessage(
+            conversationId,
+            turnId,
+            assistantMessageId,
+            "本次对话的场景没有开放主动备车，而且场景已经锁定。如需开启，请新建对话并在场景设置中允许。",
+            "clarification",
+          );
+          return;
+        }
+        mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
+          ? current
+          : { ...current, trip: { ...current.trip, pendingIntent: response.intent } });
+        await resolveOrPlan(
+          conversationId,
+          turnId,
+          assistantMessageId,
+          response.intent,
+        );
+      }
+    } catch (error) {
+      failTurn(conversationId, turnId, assistantMessageId, error);
+    }
+  };
+
+  const sendMessage = (rawText: string, targetConversationId = activeConversationId) => {
+    const text = rawText.trim();
+    const conversation = conversationById(targetConversationId);
+    if (!text || !conversation || !conversation.scenario.ready) return;
+    if (["pending", "resolving_places", "planning", "answering"].includes(conversation.turn.status)) return;
+
+    const turnId = newId("turn");
+    const userMessage = createChatMessage({
+      conversationId: conversation.id,
+      turnId,
+      role: "user",
+      content: text,
+    });
+    const assistantMessage = createChatMessage({
+      conversationId: conversation.id,
+      turnId,
+      role: "assistant",
+      kind: "status",
+      status: "pending",
+      content: "我在理解你的安排…",
+    });
+    let next = beginConversationTurn(conversation, {
+      turnId,
+      status: "pending",
+      pendingIntent: conversation.trip.pendingIntent,
+    });
+    next = appendConversationMessage(next, userMessage);
+    next = appendConversationMessage(next, assistantMessage);
+    mutateConversation(conversation.id, () => next);
+    if (conversation.id === activeConversationId) setComposer("");
+    void runConversationTurn(conversation.id, turnId, assistantMessage.id, text);
+  };
+
+  const chooseCandidate = (place: ResolvedPlace) => {
+    if (!activeResolution) return;
+    const { conversationId, turnId, intent, target } = activeResolution;
+    const conversation = conversationById(conversationId);
+    if (!conversation || conversation.turn.turnId !== turnId) return;
     const nextIntent = structuredClone(intent);
-    if (resolution.type === "origin") {
+    if (target.type === "origin") {
       nextIntent.origin = { ...nextIntent.origin, query: place.name, label: place.name, resolved: place };
     } else {
-      nextIntent.stops[resolution.index] = {
-        ...nextIntent.stops[resolution.index],
+      nextIntent.stops[target.index] = {
+        ...nextIntent.stops[target.index],
         query: place.name,
         label: place.name,
         resolved: place,
       };
     }
-    setResolution(null);
-    setCandidates([]);
-    await resolveOrPlan(nextIntent);
+    const selectionMessage = createChatMessage({
+      conversationId,
+      turnId,
+      role: "user",
+      content: `选择地点：${place.name}（${place.district}）`,
+    });
+    const assistantMessage = createChatMessage({
+      conversationId,
+      turnId,
+      role: "assistant",
+      kind: "status",
+      status: "pending",
+      content: "地点已确认，继续规划…",
+    });
+    setResolutions((current) => {
+      const next = { ...current };
+      delete next[conversationId];
+      return next;
+    });
+    mutateConversation(conversationId, (current) => {
+      let next = appendConversationMessage(current, selectionMessage);
+      next = appendConversationMessage(next, assistantMessage);
+      return { ...next, trip: { ...next.trip, pendingIntent: nextIntent } };
+    });
+    void resolveOrPlan(conversationId, turnId, assistantMessage.id, nextIntent);
   };
 
-  const replaySimulation = () => {
-    if (!plan) return;
-    if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    const startedAt = performance.now();
-    const durationMs = SIMULATION_DURATION_SEC * 1000;
-    setSimulationProgress(0);
-
-    const tick = (time: number) => {
-      const progress = Math.min(1, (time - startedAt) / durationMs);
-      setSimulationProgress(progress);
-      if (progress < 1) animationRef.current = requestAnimationFrame(tick);
-    };
-    animationRef.current = requestAnimationFrame(tick);
+  const updateResolutionQuery = (query: string) => {
+    if (!activeResolution) return;
+    const { conversationId, turnId, target } = activeResolution;
+    setResolutions((current) => {
+      const resolution = current[conversationId];
+      if (!resolution || resolution.turnId !== turnId) return current;
+      const intent = structuredClone(resolution.intent);
+      if (target.type === "origin") {
+        intent.origin = { ...intent.origin, query, label: query, resolved: null };
+      } else if (intent.stops[target.index]) {
+        intent.stops[target.index] = {
+          ...intent.stops[target.index],
+          query,
+          label: query,
+          resolved: null,
+        };
+      }
+      return {
+        ...current,
+        [conversationId]: {
+          ...resolution,
+          intent,
+          target: { ...resolution.target, query },
+          searchError: "",
+        },
+      };
+    });
   };
 
-  useEffect(() => () => {
-    if (animationRef.current) cancelAnimationFrame(animationRef.current);
-  }, []);
+  const researchResolution = async () => {
+    if (!activeResolution || activeResolution.searching) return;
+    const { conversationId, turnId, assistantMessageId, target } = activeResolution;
+    const query = target.query.trim();
+    if (!query) return;
+    const conversation = conversationById(conversationId);
+    if (!conversation || conversation.turn.turnId !== turnId) return;
 
-  const simulation = useMemo(
-    () => getSimulationSnapshot(plan, simulationProgress ?? 0),
-    [plan, simulationProgress],
+    setResolutions((current) => {
+      const resolution = current[conversationId];
+      return !resolution || resolution.turnId !== turnId
+        ? current
+        : {
+            ...current,
+            [conversationId]: {
+              ...resolution,
+              candidates: [],
+              searching: true,
+              searchError: "",
+            },
+          };
+    });
+    mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
+      ? current
+      : replaceMessage(current, assistantMessageId, (message) => ({
+          ...message,
+          status: "pending",
+          content: `正在重新搜索“${query}”…`,
+        })));
+
+    try {
+      const result = await fetchJson<PlaceSearchResponse>(
+        `/api/places/search?q=${encodeURIComponent(query)}&city=${encodeURIComponent(conversation.trip.pendingIntent?.city ?? activeResolution.intent.city)}`,
+      );
+      setResolutions((current) => {
+        const resolution = current[conversationId];
+        return !resolution || resolution.turnId !== turnId
+          ? current
+          : {
+              ...current,
+              [conversationId]: {
+                ...resolution,
+                candidates: result.candidates,
+                searching: false,
+                searchError: result.candidates.length ? "" : "没有找到匹配地点，请换个关键词。",
+              },
+            };
+      });
+      mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
+        ? current
+        : replaceMessage(current, assistantMessageId, (message) => ({
+            ...message,
+            kind: "clarification",
+            status: "complete",
+            content: result.candidates.length
+              ? `我找到了新的“${query}”候选，请选择具体地点。`
+              : `没有找到“${query}”，请换个关键词再试。`,
+          })));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "地点搜索失败，请稍后重试。";
+      setResolutions((current) => {
+        const resolution = current[conversationId];
+        return !resolution || resolution.turnId !== turnId
+          ? current
+          : {
+              ...current,
+              [conversationId]: { ...resolution, searching: false, searchError: message },
+            };
+      });
+      mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
+        ? current
+        : replaceMessage(current, assistantMessageId, (item) => ({
+            ...item,
+            kind: "clarification",
+            status: "complete",
+            content: message,
+          })));
+    }
+  };
+
+  const cancelResolution = () => {
+    if (!activeResolution) return;
+    const { conversationId, turnId, assistantMessageId } = activeResolution;
+    setResolutions((current) => {
+      const next = { ...current };
+      delete next[conversationId];
+      return next;
+    });
+    mutateConversation(conversationId, (conversation) => {
+      if (conversation.turn.turnId !== turnId) return conversation;
+      const timestamp = new Date().toISOString();
+      let next = clearPendingConversationIntent(conversation, timestamp);
+      next = {
+        ...next,
+        turn: { ...next.turn, status: "cancelled", updatedAt: timestamp, error: null },
+      };
+      return replaceMessage(next, assistantMessageId, (message) => ({
+        ...message,
+        kind: "clarification",
+        status: "complete",
+        content: "已取消这次修改，原来的路线保持不变。",
+      }));
+    });
+  };
+
+  const refreshCurrentPlan = () => {
+    const conversation = activeConversation;
+    const intent = conversation?.trip.currentIntent;
+    if (!conversation || !intent || !conversation.scenario.ready) return;
+    if (["pending", "resolving_places", "planning", "answering"].includes(conversation.turn.status)) return;
+    const turnId = newId("turn");
+    const userMessage = createChatMessage({
+      conversationId: conversation.id,
+      turnId,
+      role: "user",
+      content: "刷新当前路线和天气",
+    });
+    const assistantMessage = createChatMessage({
+      conversationId: conversation.id,
+      turnId,
+      role: "assistant",
+      kind: "status",
+      status: "pending",
+      content: "正在刷新路线和天气…",
+    });
+    let next = beginConversationTurn(conversation, { turnId, status: "planning" });
+    next = appendConversationMessage(next, userMessage);
+    next = appendConversationMessage(next, assistantMessage);
+    mutateConversation(conversation.id, () => next);
+    void executePlan(conversation.id, turnId, assistantMessage.id, intent);
+  };
+
+  const createNewConversation = () => {
+    if (activeConversation && activeConversation.messages.length === 0 && !activeConversation.scenario.ready) {
+      setHistoryOpen(false);
+      setScenarioViewOpen(false);
+      return;
+    }
+    const conversation = createEmptyConversation();
+    const nextConversations = [conversation, ...conversationsRef.current];
+    conversationsRef.current = nextConversations;
+    setConversations(nextConversations);
+    setScenarioDrafts((current) => ({ ...current, [conversation.id]: cloneDefaultScenario() }));
+    setActiveConversationId(conversation.id);
+    setHistoryOpen(false);
+    setScenarioViewOpen(false);
+    setComposer("");
+  };
+
+  const selectConversation = (id: string) => {
+    setActiveConversationId(id);
+    setHistoryOpen(false);
+    setScenarioViewOpen(false);
+    setComposer("");
+  };
+
+  const lockActiveScenario = () => {
+    if (!activeConversation || activeConversation.scenario.ready) return;
+    const draft = scenarioDrafts[activeConversation.id] ?? cloneDefaultScenario();
+    mutateConversation(activeConversation.id, (conversation) => lockConversationScenario(conversation, draft));
+    setScenarioDrafts((current) => {
+      const next = { ...current };
+      delete next[activeConversation.id];
+      return next;
+    });
+    window.setTimeout(() => composerRef.current?.focus(), 0);
+  };
+
+  const retryMessage = (message: ChatMessage) => {
+    const conversation = conversationById(message.conversationId);
+    const userMessage = conversation?.messages.find((item) =>
+      item.turnId === message.turnId && item.role === "user" && !item.content.startsWith("选择地点："),
+    );
+    if (userMessage) sendMessage(userMessage.content, message.conversationId);
+  };
+
+  const orderedConversations = useMemo(
+    () => [...conversations].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    [conversations],
   );
-  const displayStage: DemoStage = simulationProgress === null ? (plan ? "PLANNED" : "DRAFT") : simulation.stage;
-  const currentBattery = plan
-    ? Math.max(
-        plan.vehicle.estimatedArrivalBattery,
-        Math.round((plan.vehicle.batteryPercent - (plan.vehicle.batteryPercent - plan.vehicle.estimatedArrivalBattery) * simulation.driveProgress) * 10) / 10,
-      )
-    : settings.batteryPercent;
-
-  const nomiMessage = useMemo(() => {
-    if (!plan) return "告诉我你的出行安排，我来把时间、路线、天气和车况放在一起。";
-    if (displayStage === "PLANNED") {
-      if (narration?.text) return narration.text;
-      const proactiveCount = plan.actions.filter((item) => item.type !== "LEAVE_BUFFER").length || 1;
-      return `计划好了。建议 ${plan.departureTime} 出发，我还准备了 ${proactiveCount} 项主动服务。`;
-    }
-    if (displayStage === "CONFIRMED") return "行程已确认，我会按计划照顾好出发前的准备。";
-    if (displayStage === "PRECONDITIONING") {
-      const climate = plan.actions.find((item) => item.type === "PREHEAT" || item.type === "PRECOOL");
-      return climate ? `${climate.title}已开始，上车时会刚刚好。` : "正在检查座舱与行程状态。";
-    }
-    if (displayStage === "READY") return `车辆已经准备好，建议 ${plan.departureTime} 出发。`;
-    if (displayStage === "AT_STOP") return `已经到达${plan.legs[simulation.activeLegIndex].to.name}，接下来继续前往下一站。`;
-    if (displayStage === "COMPLETED") return `已到达${plan.legs.at(-1)?.to.name}。今天的行程完成了。`;
-    return `正在前往${plan.legs[simulation.activeLegIndex]?.to.name ?? "下一站"}，预计 ${plan.stops[simulation.activeLegIndex]?.eta} 到达。`;
-  }, [displayStage, narration, plan, simulation.activeLegIndex]);
-
-  const mapWeather = plan?.weather;
-  const headerWeatherCondition = settings.enabled ? settings.condition : mapWeather?.condition;
-  const headerTemperatureC = settings.enabled ? settings.cabinTemperatureC : mapWeather?.temperatureC;
-  const simulatedTime = getSimulatedTime(plan, simulationProgress);
-  const simulatedClock = simulatedTime ? new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    timeZone: "Asia/Shanghai",
-  }).format(simulatedTime) : null;
-
-  const changeIntent = (updater: (draft: TripIntentDraft) => void) => {
-    if (!intent) return;
-    const next = structuredClone(intent);
-    updater(next);
-    setIntent(next);
-    setPlan(null);
-    setNarration(null);
-    narrationRequestRef.current += 1;
-    setNarrating(false);
-    setSimulationProgress(null);
-  };
-
-  const amapReady = health
-    ? Object.values(health.providers).every(Boolean)
+  const busy = activeConversation
+    ? ["pending", "resolving_places", "planning", "answering"].includes(activeConversation.turn.status)
     : false;
+  const amapReady = health ? Object.values(health.providers).every(Boolean) : false;
   const connectionLabel = health?.ready
     ? "实时服务已连接"
     : amapReady && health?.ai.minimax.selected && !health.ai.minimax.configured
       ? "等待 MiniMax 配置"
       : "等待高德凭证";
-  const understandingLabel = intent?.understanding?.provider === "minimax"
-    ? "MiniMax 理解"
-    : intent?.understanding?.fallback
-      ? "规则理解 · 回退"
-      : "规则理解";
-  const narrationLabel = narrating
-    ? "表达生成中"
-    : narration?.provider === "minimax"
-      ? "MiniMax 表达"
-      : narration?.fallback
-        ? "模板表达 · 回退"
-        : "模板表达";
+  const headerWeatherCondition = activeScenario?.enabled
+    ? activeScenario.condition
+    : activePlan?.weather.condition;
+  const headerTemperatureC = activeScenario?.enabled
+    ? activeScenario.cabinTemperatureC
+    : activePlan?.weather.temperatureC;
+
+  if (!hydrated || !activeConversation) {
+    return (
+      <main className="cockpit cockpit-loading">
+        <div className="app-loading"><NomiOrb active /><strong>正在恢复对话与行程…</strong></div>
+      </main>
+    );
+  }
+
+  const scenarioDraft = scenarioDrafts[activeConversation.id] ?? cloneDefaultScenario();
 
   return (
     <main className="cockpit">
       <header className="top-bar">
         <div className="brand-lockup">
-          <NomiOrb active={loading !== null || narrating || (simulationProgress !== null && simulationProgress < 1)} />
-          <div>
-            <span className="eyebrow">NOMI EVERYWHERE</span>
-            <strong>出行代理</strong>
-          </div>
+          <NomiOrb active={busy} />
+          <div><span className="eyebrow">NOMI EVERYWHERE</span><strong>出行代理</strong></div>
         </div>
         <div className="top-center-status">
           <span className={`provider-dot ${health?.ready ? "is-ready" : ""}`} />
           {connectionLabel}
-          {settings.enabled && <em>演示数据</em>}
+          {activeScenario?.enabled && <em>会话场景</em>}
         </div>
         <div className="system-status">
           <span><WeatherIcon />{headerWeatherCondition && headerTemperatureC !== null && headerTemperatureC !== undefined ? `${headerWeatherCondition} ${headerTemperatureC}°` : "--°"}</span>
           <span><BatteryIcon />{currentBattery.toFixed(currentBattery % 1 ? 1 : 0)}%</span>
-          {simulatedClock && <strong className="simulated-clock"><small>模拟</small>{simulatedClock}</strong>}
-          <button className="icon-button" onClick={() => setShowLab(true)} aria-label="打开 Demo Lab"><SettingsIcon /></button>
+          <button
+            className="icon-button"
+            onClick={() => activeConversation.scenario.ready && setScenarioViewOpen(true)}
+            disabled={!activeConversation.scenario.ready}
+            aria-label="查看本次对话场景"
+          >
+            <SettingsIcon />
+          </button>
         </div>
       </header>
 
-      <section className="cockpit-main">
+      <section className="cockpit-main conversation-layout">
         <div className="map-region">
-          <AmapMap plan={plan} vehiclePosition={simulation.position} activeLegIndex={simulation.activeLegIndex} />
+          <AmapMap plan={activePlan} />
           <div className="map-floating-status glass-card">
-            <span className="stage-kicker">{STAGE_LABELS[displayStage]}</span>
-            {plan ? (
+            <span className="stage-kicker">{activePlan ? "计划已生成" : "等待规划"}</span>
+            {activePlan ? (
               <>
-                <strong>{plan.intent.origin.resolved?.name} <ArrowIcon /> {plan.intent.stops.map((stop) => stop.resolved?.name ?? stop.query).join(" · ")}</strong>
-                <div><span>{formatDistance(plan.totalDistanceM)}</span><i /><span>{formatDuration(plan.totalDurationSec)}</span><i /><span>{plan.departureTime} 出发</span></div>
+                <strong>
+                  {activePlan.intent.origin.resolved?.name} <ArrowIcon /> {activePlan.intent.stops.map((stop) => stop.resolved?.name ?? stop.query).join(" · ")}
+                </strong>
+                <div>
+                  <span>{formatDistance(activePlan.totalDistanceM)}</span><i />
+                  <span>{formatDuration(activePlan.totalDurationSec)}</span><i />
+                  <span>{activePlan.departureTime} 出发</span>
+                </div>
+                <small className="map-snapshot-time">规划于 {historyTime(activeConversation.trip.planUpdatedAt ?? activePlan.createdAt)}</small>
               </>
             ) : (
               <>
-                <strong>上海 · 智能出行准备中</strong>
+                <strong>{activeConversation.scenario.ready ? "上海 · 等待你的出行安排" : "先设置本次对话场景"}</strong>
                 <div><span>路线</span><i /><span>天气</span><i /><span>车况</span></div>
               </>
             )}
           </div>
 
-          {plan && (
+          {activePlan && (
             <div className="route-stop-strip glass-card">
-              <div className="route-stop is-origin"><span>{plan.intent.origin.resolved?.name ?? plan.intent.origin.query}</span><small>{plan.departureTime}</small></div>
-              {plan.stops.map((stop, index) => (
-                <div className={`route-stop ${simulation.activeLegIndex === index && displayStage === "EN_ROUTE" ? "is-active" : ""}`} key={stop.place.id}>
+              <div className="route-stop is-origin"><span>{activePlan.intent.origin.resolved?.name ?? activePlan.intent.origin.query}</span><small>{activePlan.departureTime}</small></div>
+              {activePlan.stops.map((stop, index) => (
+                <div className="route-stop" key={`${stop.place.id}-${index}`}>
                   <span>{stop.place.name}</span><small>{stop.eta}</small>
                 </div>
               ))}
@@ -635,385 +1155,183 @@ export function Cockpit() {
           )}
         </div>
 
-        <aside className="agent-panel">
-          <div className="agent-heading">
-            <div>
-              <span className="eyebrow">ACTIVE COMPANION</span>
-              <h1>早上好，我是 NOMI</h1>
+        <aside className="agent-panel chat-panel">
+          <header className="chat-header">
+            <button className="chat-header-button" onClick={() => setHistoryOpen(true)} aria-label="查看历史对话">
+              <RouteIcon /><span>历史</span>
+            </button>
+            <div className="chat-title">
+              <span className="eyebrow">ACTIVE CONVERSATION</span>
+              <strong>{activeConversation.title}</strong>
             </div>
-            {plan && <span className="plan-state-pill">{STAGE_LABELS[displayStage]}</span>}
-          </div>
-
-          <section className="nomi-message-card">
-            <div className="message-orb"><NomiOrb active={loading !== null || narrating || displayStage === "PRECONDITIONING" || displayStage === "EN_ROUTE"} /></div>
-            <div className="message-content">
-              <p>{loading ? (loading === "parse" ? "我在理解你的安排…" : loading === "places" ? "正在确认地点…" : "正在结合路线、天气和车况…") : nomiMessage}</p>
-              {intent && (
-                <div className="data-provenance" aria-label="数据来源">
-                  <span>{understandingLabel}</span>
-                  {plan && <span>规则规划</span>}
-                  {plan && <span>高德数据</span>}
-                  {plan && <span>{narrationLabel}</span>}
-                </div>
+            <div className="chat-header-actions">
+              {activeConversation.scenario.ready && (
+                <button onClick={() => setScenarioViewOpen(true)}>场景</button>
               )}
+              <button className="new-chat-button" onClick={createNewConversation}>＋ 新对话</button>
             </div>
-          </section>
+          </header>
 
-          {error && (
-            <section className="error-card" role="alert">
-              <div><strong>{error.code === "AMAP_KEY_MISSING" ? "还差一步配置" : "这次没有规划成功"}</strong><p>{error.message}</p></div>
-              <button onClick={() => setError(null)} aria-label="关闭错误"><CloseIcon /></button>
-            </section>
+          {storageWarning && (
+            <div className="storage-warning" role="status">
+              <span>{storageWarning}</span>
+              <button onClick={() => setStorageWarning("")} aria-label="关闭存储提示"><CloseIcon /></button>
+            </div>
           )}
 
-          {!plan && !intent && (
-            <section className="welcome-stack">
-              <div className="welcome-card accent-mint"><SparkIcon /><div><strong>一句话生成完整行程</strong><p>我会区分出发和到达时间，并主动确认不明确的地点。</p></div></div>
-              <div className="welcome-card"><RouteIcon /><div><strong>真实路线与天气</strong><p>行程时间、里程和环境建议来自确定性服务。</p></div></div>
-              <div className="scenario-hint"><span>可以试试</span><button onClick={() => setPrompt("明天 7:30 从家出发，先去虹桥火车站，再去公司。")}>多站行程</button><button onClick={() => { setPrompt(SAMPLE_PROMPT); setShowLab(true); }}>低温送娃</button></div>
-            </section>
-          )}
-
-          {intent && (isEditing || !plan) && (
-            <IntentEditor
-              intent={intent}
-              onChange={changeIntent}
-              onCancel={() => setIsEditing(false)}
-              onPlan={() => resolveOrPlan(intent)}
-              loading={loading !== null}
+          {!activeConversation.scenario.ready ? (
+            <ConversationScenario
+              key={activeConversation.id}
+              value={scenarioDraft}
+              mode="setup"
+              onChange={(value) => setScenarioDrafts((current) => ({ ...current, [activeConversation.id]: value }))}
+              onConfirm={lockActiveScenario}
             />
+          ) : scenarioViewOpen && activeScenario ? (
+            <ConversationScenario
+              key={activeConversation.id}
+              value={activeScenario}
+              mode="view"
+              onClose={() => setScenarioViewOpen(false)}
+            />
+          ) : (
+            <>
+              <div className="chat-messages" ref={messageListRef} role="log" aria-live="polite">
+                {activeConversation.messages.length === 0 && (
+                  <div className="chat-welcome">
+                    <NomiOrb active={false} />
+                    <div>
+                      <span className="eyebrow">SCENE LOCKED</span>
+                      <h1>你好，我是 NOMI</h1>
+                      <p>本次对话的场景已经锁定。告诉我你的出行安排，之后可以继续追问或直接修改路线。</p>
+                    </div>
+                    <div className="chat-quick-prompts">
+                      <button onClick={() => setComposer(SAMPLE_PROMPT)}>送孩子再去公司</button>
+                      <button onClick={() => setComposer("明天 7:30 从家出发，先去虹桥火车站，再去公司。")}>规划多站行程</button>
+                    </div>
+                  </div>
+                )}
+
+                {activeConversation.messages.map((message) => {
+                  const isCurrentPlan = message.planId !== null && message.planId === activePlan?.id;
+                  const messageResolution = activeResolution?.assistantMessageId === message.id
+                    ? activeResolution
+                    : null;
+                  return (
+                    <div className={`chat-message-row is-${message.role}`} key={message.id}>
+                      {message.role === "assistant" && <div className="chat-avatar"><NomiOrb active={message.status === "pending"} /></div>}
+                      <div className="chat-message-stack">
+                        <div className={`chat-bubble kind-${message.kind} status-${message.status}`}>
+                          <p>{message.content}</p>
+                          {message.status === "pending" && <span className="typing-dots"><i /><i /><i /></span>}
+                        </div>
+
+                        {messageResolution && (
+                          <div className="inline-candidates">
+                            <div className="inline-place-search">
+                              <input
+                                aria-label="重新搜索地点"
+                                value={messageResolution.target.query}
+                                onChange={(event) => updateResolutionQuery(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+                                    event.preventDefault();
+                                    void researchResolution();
+                                  }
+                                }}
+                                placeholder="换个地点关键词"
+                              />
+                              <button
+                                onClick={() => void researchResolution()}
+                                disabled={messageResolution.searching || !messageResolution.target.query.trim()}
+                              >
+                                {messageResolution.searching ? "搜索中" : "重新搜索"}
+                              </button>
+                            </div>
+                            {messageResolution.searchError && (
+                              <small className="inline-search-error">{messageResolution.searchError}</small>
+                            )}
+                            {messageResolution.candidates.map((place) => (
+                              <button key={place.id} onClick={() => chooseCandidate(place)}>
+                                <strong>{place.name}</strong>
+                                <small>{place.district} · {place.address}</small>
+                              </button>
+                            ))}
+                            <button className="inline-cancel" onClick={cancelResolution}>取消这次修改</button>
+                          </div>
+                        )}
+
+                        {message.role === "assistant" && message.kind === "plan" && isCurrentPlan && (
+                          <div className="message-actions">
+                            <button onClick={refreshCurrentPlan}><RouteIcon />刷新路线</button>
+                          </div>
+                        )}
+
+                        {message.role === "assistant" && message.status === "failed" && (
+                          <div className="message-actions"><button onClick={() => retryMessage(message)}>重试这一轮</button></div>
+                        )}
+
+                        {message.role === "assistant" && message.kind === "plan" && (
+                          <small className="message-provenance">语义理解 · 规则规划 · 高德数据 · NOMI 表达</small>
+                        )}
+                        <time>{historyTime(message.createdAt)}</time>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="chat-composer">
+                <textarea
+                  ref={composerRef}
+                  value={composer}
+                  onChange={(event) => setComposer(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      sendMessage(composer);
+                    }
+                  }}
+                  placeholder={activeResolution ? "请先选择或取消地点确认" : "继续告诉 NOMI：修改时间、调整站点，或询问当前计划…"}
+                  aria-label="与 NOMI 对话"
+                  disabled={busy}
+                  maxLength={2000}
+                  rows={2}
+                />
+                <button onClick={() => sendMessage(composer)} disabled={busy || !composer.trim()} aria-label="发送消息">
+                  <ArrowIcon />
+                </button>
+                <small>{busy ? "NOMI 正在处理这一轮" : "Enter 发送 · Shift + Enter 换行"}</small>
+              </div>
+            </>
           )}
 
-          {plan && !isEditing && (
-            <PlanDetails
-              plan={plan}
-              displayStage={displayStage}
-              activeLegIndex={simulation.activeLegIndex}
-              onEdit={() => setIsEditing(true)}
-              onStart={replaySimulation}
-              simulationProgress={simulationProgress}
-            />
+          {historyOpen && (
+            <div className="history-drawer" role="dialog" aria-modal="true" aria-label="历史对话">
+              <div className="history-heading">
+                <div><span className="eyebrow">CONVERSATION HISTORY</span><h2>历史对话</h2></div>
+                <button className="icon-button" onClick={() => setHistoryOpen(false)} aria-label="关闭历史对话"><CloseIcon /></button>
+              </div>
+              <button className="history-new-button" onClick={createNewConversation}>＋ 新建一段行程对话</button>
+              <div className="history-list">
+                {orderedConversations.map((conversation) => {
+                  const lastMessage = conversation.messages.at(-1);
+                  return (
+                    <button
+                      className={conversation.id === activeConversation.id ? "is-active" : ""}
+                      key={conversation.id}
+                      onClick={() => selectConversation(conversation.id)}
+                    >
+                      <span><strong>{conversation.title}</strong><time>{historyTime(conversation.updatedAt)}</time></span>
+                      <small>{conversation.scenario.ready ? (lastMessage?.content ?? "场景已设置，等待开始对话") : "等待设置本次对话场景"}</small>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           )}
         </aside>
       </section>
-
-      <div className="command-dock">
-        <span className="command-spark"><SparkIcon /></span>
-        <input
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.nativeEvent.isComposing) analyzePrompt();
-          }}
-          placeholder="告诉 NOMI：什么时候出发、先去哪里、再去哪里…"
-          aria-label="自然语言出行需求"
-        />
-        <button onClick={analyzePrompt} disabled={loading !== null || !prompt.trim()}>
-          {loading === "parse" ? "理解中" : "规划行程"}<ArrowIcon />
-        </button>
-      </div>
-
-      {showLab && (
-        <DemoLab
-          value={settings}
-          onChange={setSettings}
-          onClose={() => setShowLab(false)}
-          onApply={() => {
-            setShowLab(false);
-            if (intent) {
-              const configuredIntent = applySettingsToIntent(intent, settings);
-              setIntent(configuredIntent);
-              if (!findUnresolved(configuredIntent)) requestPlan(configuredIntent);
-            }
-          }}
-        />
-      )}
-
-      {resolution && (
-        <PlaceCandidateModal
-          target={resolution}
-          candidates={candidates}
-          onChoose={chooseCandidate}
-          onClose={() => { setResolution(null); setCandidates([]); setIsEditing(true); }}
-        />
-      )}
     </main>
-  );
-}
-
-function IntentEditor({
-  intent,
-  onChange,
-  onCancel,
-  onPlan,
-  loading,
-}: {
-  intent: TripIntentDraft;
-  onChange: (updater: (draft: TripIntentDraft) => void) => void;
-  onCancel: () => void;
-  onPlan: () => void;
-  loading: boolean;
-}) {
-  const timeConstraints = intent.timeConstraints?.length
-    ? intent.timeConstraints
-    : [intent.timeConstraint];
-  return (
-    <section className="intent-editor panel-card">
-      <div className="card-title-row">
-        <div><span className="eyebrow">STRUCTURED INTENT</span><h2>我理解的行程</h2></div>
-        <span className="confidence">{Math.round(intent.confidence * 100)}% 置信度</span>
-      </div>
-      {intent.issues.length > 0 && <div className="intent-issue">{intent.issues[0]}</div>}
-      {intent.issues.length === 0 && intent.timeConstraint.inferred && (
-        <div className="intent-assumption">
-          时间未完全指定，已暂按 {intent.timeConstraint.time}{intent.timeConstraint.type === "DEPART_AT" ? " 出发" : " 到达"}规划，可直接修改。
-        </div>
-      )}
-      {timeConstraints.length > 1 && (
-        <div className="intent-constraints-summary">
-          {timeConstraints.map((constraint, index) => (
-            <span key={`${constraint.type}-${constraint.time}-${constraint.targetStopIndex}-${index}`}>
-              {constraint.time} {constraint.type === "DEPART_AT"
-                ? "从起点出发"
-                : `到达${intent.stops[constraint.targetStopIndex]?.query ?? `第 ${constraint.targetStopIndex + 1} 站`}`}
-            </span>
-          ))}
-        </div>
-      )}
-      <div className="form-grid two-columns">
-        <label><span>日期</span><input type="date" value={intent.date} onChange={(event) => onChange((draft) => { draft.date = event.target.value; })} /></label>
-        <label><span>{timeConstraints.length > 1 ? "最后一个时间锚点" : "时间"}</span><input type="time" value={intent.timeConstraint.time} onChange={(event) => onChange((draft) => { updatePrimaryTimeConstraint(draft, (constraint) => { constraint.time = event.target.value; }); })} /></label>
-      </div>
-      <div className="constraint-switch" role="group" aria-label="时间约束">
-        <button className={intent.timeConstraint.type === "ARRIVE_BY" ? "is-selected" : ""} onClick={() => onChange((draft) => { updatePrimaryTimeConstraint(draft, (constraint) => { constraint.type = "ARRIVE_BY"; constraint.targetStopIndex = 0; constraint.inferred = false; }); })}>按时到达</button>
-        <button className={intent.timeConstraint.type === "DEPART_AT" ? "is-selected" : ""} onClick={() => onChange((draft) => { updatePrimaryTimeConstraint(draft, (constraint) => { constraint.type = "DEPART_AT"; constraint.targetStopIndex = 0; constraint.inferred = false; }); })}>准时出发</button>
-      </div>
-      {intent.timeConstraint.type === "ARRIVE_BY" && intent.stops.length > 1 && (
-        <label className="target-stop-select">
-          <span>按时到达</span>
-          <select value={intent.timeConstraint.targetStopIndex} onChange={(event) => onChange((draft) => { updatePrimaryTimeConstraint(draft, (constraint) => { constraint.targetStopIndex = Number(event.target.value); }); })}>
-            {intent.stops.map((stop, index) => <option value={index} key={stop.key}>{stop.query || `第 ${index + 1} 站`}</option>)}
-          </select>
-        </label>
-      )}
-      <div className="place-edit-list">
-        <label className="place-field"><span className="place-index is-home">家</span><div><small>出发地</small><input value={intent.origin.query} onChange={(event) => onChange((draft) => { draft.origin = updatePlaceDraft(draft.origin, event.target.value); })} /></div></label>
-        {intent.stops.map((stop, index) => (
-          <label className="place-field" key={stop.key}>
-            <span className="place-index">{index + 1}</span>
-            <div><small>{intent.timeConstraint.type === "ARRIVE_BY" && intent.timeConstraint.targetStopIndex === index ? "准时到达这里" : `第 ${index + 1} 站`}</small><input value={stop.query} onChange={(event) => onChange((draft) => { draft.stops[index] = updatePlaceDraft(draft.stops[index], event.target.value); })} /></div>
-            <button className="remove-stop" onClick={(event) => { event.preventDefault(); onChange((draft) => { draft.stops.splice(index, 1); draft.timeConstraint.targetStopIndex = Math.min(draft.timeConstraint.targetStopIndex, Math.max(0, draft.stops.length - 1)); }); }} aria-label={`删除${stop.query}`}><CloseIcon /></button>
-          </label>
-        ))}
-        {intent.stops.length < 3 && <button className="add-stop" onClick={() => onChange((draft) => { draft.stops.push({ key: `new-${Date.now()}`, label: "", query: "", resolved: null }); })}>＋ 添加途经点</button>}
-      </div>
-      <div className="editor-actions">
-        <button className="secondary-button" onClick={onCancel}>稍后再说</button>
-        <button className="primary-button" onClick={onPlan} disabled={loading || intent.stops.length === 0}>{loading ? "正在规划" : "确认并生成计划"}<ArrowIcon /></button>
-      </div>
-    </section>
-  );
-}
-
-function PlanDetails({
-  plan,
-  displayStage,
-  activeLegIndex,
-  onEdit,
-  onStart,
-  simulationProgress,
-}: {
-  plan: TripPlan;
-  displayStage: DemoStage;
-  activeLegIndex: number;
-  onEdit: () => void;
-  onStart: () => void;
-  simulationProgress: number | null;
-}) {
-  const severityRank = { critical: 0, warning: 1, suggestion: 2, info: 3 } as const;
-  const proactiveActions = plan.actions
-    .filter((item) => item.type !== "LEAVE_BUFFER")
-    .sort((left, right) => severityRank[left.severity] - severityRank[right.severity]);
-  const displayedActions = proactiveActions.length
-    ? proactiveActions
-    : plan.actions.filter((item) => item.type === "LEAVE_BUFFER");
-  return (
-    <div className="plan-details">
-      <section className="trip-summary panel-card">
-        <div className="card-title-row">
-          <div><span className="eyebrow">TRIP PLAN</span><h2>{formatChineseDate(plan.intent.date)} · {plan.departureTime} 出发</h2></div>
-          <button className="text-icon-button" onClick={onEdit}><EditIcon />调整</button>
-        </div>
-        <div className="summary-metrics">
-          <div><RouteIcon /><span><small>总里程</small><strong>{formatDistance(plan.totalDistanceM)}</strong></span></div>
-          <div><ClockIcon /><span><small>预计用时</small><strong>{formatDuration(plan.totalDurationSec)}</strong></span></div>
-          <div><BatteryIcon /><span><small>到达电量</small><strong>{plan.vehicle.estimatedArrivalBattery}%</strong></span></div>
-        </div>
-      </section>
-
-      <section className="timeline-card panel-card">
-        <div className="section-label"><span>行程时间轴</span><em>{plan.weather.source === "override" ? "演示数据" : "实时规划"}</em></div>
-        <div className="timeline-list">
-          {plan.actions.find((item) => item.type === "PREHEAT" || item.type === "PRECOOL") && (
-            <div className={`timeline-row ${displayStage === "PRECONDITIONING" ? "is-current" : ""}`}><span className="timeline-time">{new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Shanghai" }).format(new Date(plan.actions.find((item) => item.type === "PREHEAT" || item.type === "PRECOOL")!.scheduledAt!))}</span><i /><div><strong>开始备车</strong><small>{plan.actions.find((item) => item.type === "PREHEAT" || item.type === "PRECOOL")!.title}</small></div></div>
-          )}
-          <div className={`timeline-row ${displayStage === "READY" || (displayStage === "EN_ROUTE" && activeLegIndex === 0) ? "is-current" : ""}`}><span className="timeline-time">{plan.departureTime}</span><i /><div><strong>从{plan.intent.origin.resolved?.name}出发</strong><small>已包含 {Math.round(plan.planningBufferSec / 60)} 分钟路况缓冲</small></div></div>
-          {plan.stops.map((stop, index) => (
-            <Fragment key={stop.place.id}>
-              <div className={`timeline-row ${activeLegIndex === index && (displayStage === "EN_ROUTE" || displayStage === "AT_STOP") ? "is-current" : ""}`}><span className="timeline-time">{stop.eta}</span><i /><div><strong>到达{stop.place.name}</strong><small>{index < plan.stops.length - 1 ? `计划停留约 ${Math.round((stop.dwellSec ?? 300) / 60)} 分钟` : "本次行程终点"}</small></div></div>
-              {index < plan.stops.length - 1 && stop.departureTime && (
-                <div className="timeline-row"><span className="timeline-time">{stop.departureTime}</span><i /><div><strong>{(stop.dwellSec ?? 0) > 300 ? "最晚" : "继续"}从{stop.place.name}出发</strong><small>前往{plan.stops[index + 1].place.name}</small></div></div>
-              )}
-            </Fragment>
-          ))}
-        </div>
-      </section>
-
-      <section className="active-service-card panel-card">
-        <div className="section-label"><span>NOMI 主动服务</span><em>{displayedActions.length} 项</em></div>
-        <div className="service-list">
-          {displayedActions.map((item) => (
-            <div className={`service-item severity-${item.severity}`} key={item.id}><span><SparkIcon /></span><div><strong>{item.title}</strong><p>{item.detail}</p></div></div>
-          ))}
-        </div>
-      </section>
-
-      <button className="start-demo-button" onClick={onStart}>
-        <span>{simulationProgress === null ? "确认计划并开始 15 秒演示" : simulationProgress >= 1 ? "重新播放 15 秒演示" : "从头播放演示"}</span>
-        <ArrowIcon />
-      </button>
-      <p className="data-note">{plan.notes[0]}</p>
-    </div>
-  );
-}
-
-function DemoLab({
-  value,
-  onChange,
-  onClose,
-  onApply,
-}: {
-  value: DemoSettings;
-  onChange: (value: DemoSettings) => void;
-  onClose: () => void;
-  onApply: () => void;
-}) {
-  const [editingPlace, setEditingPlace] = useState<FavoritePlaceKey | null>(null);
-  const [placeQuery, setPlaceQuery] = useState("");
-  const [placeCandidates, setPlaceCandidates] = useState<ResolvedPlace[]>([]);
-  const [placeSearchState, setPlaceSearchState] = useState<"idle" | "loading" | "empty" | "error">("idle");
-
-  const beginPlaceEdit = (key: FavoritePlaceKey) => {
-    setEditingPlace(key);
-    setPlaceQuery(value.favoritePlaces[key].address || value.favoritePlaces[key].name);
-    setPlaceCandidates([]);
-    setPlaceSearchState("idle");
-  };
-
-  const searchFavoritePlace = async () => {
-    if (!placeQuery.trim()) return;
-    setPlaceSearchState("loading");
-    setPlaceCandidates([]);
-    try {
-      const result = await fetchJson<PlaceSearchResponse>(
-        `/api/places/search?q=${encodeURIComponent(placeQuery)}&city=${encodeURIComponent("上海市")}`,
-      );
-      setPlaceCandidates(result.candidates);
-      setPlaceSearchState(result.candidates.length ? "idle" : "empty");
-    } catch {
-      setPlaceSearchState("error");
-    }
-  };
-
-  const chooseFavoritePlace = (place: ResolvedPlace) => {
-    if (!editingPlace) return;
-    onChange({
-      ...value,
-      favoritePlaces: { ...value.favoritePlaces, [editingPlace]: place },
-    });
-    setEditingPlace(null);
-    setPlaceCandidates([]);
-    setPlaceSearchState("idle");
-  };
-
-  return (
-    <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <aside className="demo-lab">
-        <div className="drawer-heading"><div><span className="eyebrow">SCENARIO OVERRIDE</span><h2>Demo Lab</h2></div><button className="icon-button" onClick={onClose}><CloseIcon /></button></div>
-        <p className="drawer-intro">集中管理默认地点与主动服务偏好；演示场景固定用 15 秒播放完整行程。</p>
-        <section className="lab-section">
-          <div className="lab-section-title"><strong>默认偏好</strong><small>应用于每次新规划</small></div>
-          <label className="toggle-row"><div><strong>允许 NOMI 根据天气主动备车</strong><small>按座舱温度判断预热或制冷</small></div><input type="checkbox" checked={value.preconditionVehicle} onChange={(event) => onChange({ ...value, preconditionVehicle: event.target.checked })} /><span /></label>
-        </section>
-
-        <section className="lab-section">
-          <div className="lab-section-title"><strong>常用地点</strong><small>输入地址后从高德候选中确认</small></div>
-          <div className="favorite-place-list">
-            {FAVORITE_PLACE_KEYS.map((key) => {
-              const place = value.favoritePlaces[key];
-              return (
-                <div className="favorite-place-item" key={key}>
-                  <div><span>{FAVORITE_PLACE_LABELS[key]}</span><strong>{place.name}</strong><small>{place.district} · {place.address}</small></div>
-                  <button onClick={() => beginPlaceEdit(key)}>修改</button>
-                </div>
-              );
-            })}
-          </div>
-          {editingPlace && (
-            <div className="favorite-place-editor">
-              <div className="place-search-row">
-                <input value={placeQuery} onChange={(event) => setPlaceQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) searchFavoritePlace(); }} placeholder={`搜索${FAVORITE_PLACE_LABELS[editingPlace]}的具体地址`} autoFocus />
-                <button onClick={searchFavoritePlace} disabled={placeSearchState === "loading"}>{placeSearchState === "loading" ? "搜索中" : "搜索"}</button>
-              </div>
-              {(placeSearchState === "empty" || placeSearchState === "error") && <p className="place-search-error">{placeSearchState === "empty" ? "没有找到匹配地点，请换个关键词。" : "地点搜索失败，请稍后重试。"}</p>}
-              {placeCandidates.length > 0 && (
-                <div className="favorite-place-candidates">
-                  {placeCandidates.map((place) => <button key={place.id} onClick={() => chooseFavoritePlace(place)}><strong>{place.name}</strong><small>{place.district} · {place.address}</small></button>)}
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-
-        <section className="lab-section">
-          <div className="lab-section-title"><strong>演示场景</strong><small>关闭时使用高德天气与默认模拟车况</small></div>
-        <label className="toggle-row"><div><strong>启用场景覆盖</strong><small>用于稳定触发低温、雨雪和低电量建议</small></div><input type="checkbox" checked={value.enabled} onChange={(event) => onChange({ ...value, enabled: event.target.checked })} /><span /></label>
-        <div className={`lab-controls ${value.enabled ? "" : "is-disabled"}`}>
-          <label><span>天气状况</span><select value={value.condition} onChange={(event) => onChange({ ...value, condition: event.target.value })}><option>晴</option><option>多云</option><option>小雨</option><option>暴雨</option><option>小雪</option></select></label>
-          <label><span>当前电量 <strong>{value.batteryPercent}%</strong></span><input type="range" min="5" max="100" value={value.batteryPercent} onChange={(event) => onChange({ ...value, batteryPercent: Number(event.target.value) })} /></label>
-          <label><span>座舱温度 <strong>{value.cabinTemperatureC}°C</strong></span><input type="range" min="-5" max="45" value={value.cabinTemperatureC} onChange={(event) => onChange({ ...value, cabinTemperatureC: Number(event.target.value) })} /></label>
-        </div>
-        </section>
-        <button className="primary-button full-width" onClick={onApply}>应用并重新规划<ArrowIcon /></button>
-      </aside>
-    </div>
-  );
-}
-
-function PlaceCandidateModal({
-  target,
-  candidates,
-  onChoose,
-  onClose,
-}: {
-  target: ResolutionTarget;
-  candidates: ResolvedPlace[];
-  onChoose: (place: ResolvedPlace) => void;
-  onClose: () => void;
-}) {
-  return (
-    <div className="modal-backdrop">
-      <section className="candidate-modal" role="dialog" aria-modal="true" aria-labelledby="candidate-title">
-        <div className="drawer-heading"><div><span className="eyebrow">PLACE CONFIRMATION</span><h2 id="candidate-title">你指的是哪个“{target.query}”？</h2></div><button className="icon-button" onClick={onClose}><CloseIcon /></button></div>
-        <p>选择准确地点后，我再继续计算路线和到达时间。</p>
-        <div className="candidate-list">
-          {candidates.map((place, index) => (
-            <button onClick={() => onChoose(place)} key={place.id}>
-              <span>{index + 1}</span><div><strong>{place.name}</strong><small>{place.district} · {place.address}</small></div><ArrowIcon />
-            </button>
-          ))}
-        </div>
-      </section>
-    </div>
   );
 }
