@@ -10,30 +10,48 @@ interface AmapMapProps {
   plan: TripPlan | null;
 }
 
+interface AmapBrowserConfig {
+  key: string;
+  securityJsCode: string;
+}
+
 let loaderPromise: Promise<any> | null = null;
 
 function hasValidCoordinates(position: Coordinates | null | undefined): position is Coordinates {
   return Boolean(position && Number.isFinite(position.lng) && Number.isFinite(position.lat));
 }
 
+async function fetchAmapBrowserConfig(): Promise<AmapBrowserConfig> {
+  const response = await fetch("/api/providers/amap-browser-config", {
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error("AMAP_CONFIG_MISSING");
+  const config = await response.json() as Partial<AmapBrowserConfig>;
+  if (!config.key || !config.securityJsCode) {
+    throw new Error("AMAP_CONFIG_MISSING");
+  }
+  return {
+    key: config.key,
+    securityJsCode: config.securityJsCode,
+  };
+}
+
 function loadAmap(): Promise<any> {
   if (loaderPromise) return loaderPromise;
-  const key = process.env.NEXT_PUBLIC_AMAP_JS_KEY;
-  const securityJsCode = process.env.NEXT_PUBLIC_AMAP_SECURITY_CODE;
-  if (!key || !securityJsCode) return Promise.reject(new Error("AMAP_CONFIG_MISSING"));
-
-  window._AMapSecurityConfig = { securityJsCode };
-  loaderPromise = new Promise((resolve, reject) => {
-    const start = () => {
-      window.AMapLoader?.load({ key, version: "2.0" }).then(resolve).catch(reject);
-    };
-    if (window.AMapLoader) return start();
-    const script = document.createElement("script");
-    script.src = "https://webapi.amap.com/loader.js";
-    script.async = true;
-    script.onload = start;
-    script.onerror = () => reject(new Error("AMAP_LOADER_FAILED"));
-    document.head.appendChild(script);
+  loaderPromise = fetchAmapBrowserConfig().then(({ key, securityJsCode }) => {
+    window._AMapSecurityConfig = { securityJsCode };
+    return new Promise((resolve, reject) => {
+      const start = () => {
+        window.AMapLoader?.load({ key, version: "2.0" }).then(resolve).catch(reject);
+      };
+      if (window.AMapLoader) return start();
+      const script = document.createElement("script");
+      script.src = "https://webapi.amap.com/loader.js";
+      script.async = true;
+      script.onload = start;
+      script.onerror = () => reject(new Error("AMAP_LOADER_FAILED"));
+      document.head.appendChild(script);
+    });
   });
   return loaderPromise;
 }
