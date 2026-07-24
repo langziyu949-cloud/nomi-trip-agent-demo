@@ -37,7 +37,6 @@ import {
   type ChatMessage,
   type Conversation,
 } from "@/lib/conversations";
-import { DEFAULT_PLACES } from "@/lib/default-places";
 import type {
   DemoSettings,
   FavoritePlaceKey,
@@ -62,12 +61,14 @@ const FAVORITE_PLACE_LABELS: Record<FavoritePlaceKey, string> = {
 const FAVORITE_PLACE_KEYS = Object.keys(FAVORITE_PLACE_LABELS) as FavoritePlaceKey[];
 
 const DEFAULT_SCENARIO: DemoSettings = {
-  enabled: false,
-  condition: "小雪",
-  batteryPercent: 42,
-  cabinTemperatureC: 8,
+  weatherOverrideEnabled: false,
+  condition: "晴",
+  temperatureC: 20,
+  batteryOverrideEnabled: false,
+  batteryPercent: 80,
   preconditionVehicle: true,
-  favoritePlaces: DEFAULT_PLACES,
+  favoritePlacesEnabled: false,
+  favoritePlaces: [],
 };
 
 interface HealthResponse {
@@ -147,10 +148,28 @@ function applyScenarioToIntent(
 ): TripIntentDraft {
   const next = structuredClone(intent);
   const applyFavorite = (place: PlaceDraft) => {
-    if (!isFavoritePlaceKey(place.key)) return;
-    place.resolved = structuredClone(scenario.favoritePlaces[place.key]);
-    place.label = FAVORITE_PLACE_LABELS[place.key];
-    place.query = FAVORITE_PLACE_LABELS[place.key];
+    if (!scenario.favoritePlacesEnabled) {
+      if (isFavoritePlaceKey(place.key)) place.resolved = null;
+      return;
+    }
+    const normalize = (value: string) => value.replace(/\s+/g, "").trim();
+    const favorite = scenario.favoritePlaces.find((item) => (
+      (isFavoritePlaceKey(place.key) && item.key === place.key)
+      || normalize(item.label) === normalize(place.query)
+      || normalize(item.label) === normalize(place.label)
+    ));
+    if (!favorite) {
+      if (isFavoritePlaceKey(place.key)) place.resolved = null;
+      return;
+    }
+    place.key = favorite.key ?? `favorite:${favorite.id}`;
+    place.label = favorite.label;
+    place.query = favorite.label;
+    place.resolved = {
+      ...structuredClone(favorite.place),
+      name: favorite.label,
+      source: "FAVORITE",
+    };
   };
   applyFavorite(next.origin);
   next.stops.forEach(applyFavorite);
@@ -751,21 +770,6 @@ export function Cockpit() {
           refreshDepth,
         );
       } else {
-        const currentScenario = conversationById(conversationId)?.scenario.demoSettings;
-        if (
-          currentScenario
-          && !currentScenario.preconditionVehicle
-          && response.intent.preferences.includes("precondition_vehicle")
-        ) {
-          finishAssistantMessage(
-            conversationId,
-            turnId,
-            assistantMessageId,
-            "本次对话的场景没有开放主动备车，而且场景已经锁定。如需开启，请新建对话并在场景设置中允许。",
-            "clarification",
-          );
-          return;
-        }
         mutateConversation(conversationId, (current) => current.turn.turnId !== turnId
           ? current
           : { ...current, trip: { ...current.trip, pendingIntent: response.intent } });
@@ -1075,11 +1079,11 @@ export function Cockpit() {
     : amapReady && health?.ai.minimax.selected && !health.ai.minimax.configured
       ? "等待 MiniMax 配置"
       : "等待高德凭证";
-  const headerWeatherCondition = activeScenario?.enabled
+  const headerWeatherCondition = activeScenario?.weatherOverrideEnabled
     ? activeScenario.condition
     : activePlan?.weather.condition;
-  const headerTemperatureC = activeScenario?.enabled
-    ? activeScenario.cabinTemperatureC
+  const headerTemperatureC = activeScenario?.weatherOverrideEnabled
+    ? activeScenario.temperatureC
     : activePlan?.weather.temperatureC;
 
   if (!hydrated || !activeConversation) {
@@ -1102,7 +1106,9 @@ export function Cockpit() {
         <div className="top-center-status">
           <span className={`provider-dot ${health?.ready ? "is-ready" : ""}`} />
           {connectionLabel}
-          {activeScenario?.enabled && <em>会话场景</em>}
+          {(activeScenario?.weatherOverrideEnabled
+            || activeScenario?.batteryOverrideEnabled
+            || activeScenario?.favoritePlacesEnabled) && <em>自定义场景</em>}
         </div>
         <div className="system-status">
           <span><WeatherIcon />{headerWeatherCondition && headerTemperatureC !== null && headerTemperatureC !== undefined ? `${headerWeatherCondition} ${headerTemperatureC}°` : "--°"}</span>

@@ -132,15 +132,24 @@ export interface TripPlan {
 }
 
 export interface DemoOverrides {
-  enabled: boolean;
+  weatherOverrideEnabled: boolean;
   condition: string;
+  temperatureC: number;
+  batteryOverrideEnabled: boolean;
   batteryPercent: number;
-  cabinTemperatureC: number;
+}
+
+export interface ScenarioFavoritePlace {
+  id: string;
+  key: FavoritePlaceKey | null;
+  label: string;
+  place: ResolvedPlace;
 }
 
 export interface DemoSettings extends DemoOverrides {
   preconditionVehicle: boolean;
-  favoritePlaces: Record<FavoritePlaceKey, ResolvedPlace>;
+  favoritePlacesEnabled: boolean;
+  favoritePlaces: ScenarioFavoritePlace[];
 }
 
 export interface PlaceSearchResponse {

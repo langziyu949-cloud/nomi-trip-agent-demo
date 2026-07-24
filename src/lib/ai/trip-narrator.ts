@@ -163,7 +163,7 @@ export function buildTemplateNarration(
   const hasClimateAction = actionTypes.has("PREHEAT") || actionTypes.has("PRECOOL");
   const climateContext = hasClimateAction
     ? plan.weather.source === "override"
-      ? `当前座舱 ${plan.vehicle.cabinTemperatureC}°C，`
+      ? `自定义气温 ${plan.weather.temperatureC}°C，`
       : plan.weather.temperatureC !== null
         ? `室外 ${plan.weather.temperatureC}°C，`
         : ""

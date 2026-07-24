@@ -44,11 +44,11 @@ export function buildTripPlan(
     throw new Error("路线分段数量与目的地数量不一致。 ");
   }
 
-  const weather: WeatherContext = overrides?.enabled
+  const weather: WeatherContext = overrides?.weatherOverrideEnabled
     ? {
         available: true,
         condition: overrides.condition,
-        temperatureC: rawWeather.temperatureC,
+        temperatureC: overrides.temperatureC,
         humidity: rawWeather.humidity,
         reportTime: new Date().toISOString(),
         source: "override",
@@ -172,22 +172,26 @@ export function buildTripPlan(
   const outsideTemperatureC = weather.temperatureC;
   const outsideExtremeTemperature =
     outsideTemperatureC !== null && (outsideTemperatureC <= 10 || outsideTemperatureC >= 30);
-  const cabinTemperatureC = overrides?.enabled ? overrides.cabinTemperatureC : 24;
-  const climateTemperatureC = overrides?.enabled ? cabinTemperatureC : outsideTemperatureC;
+  const cabinTemperatureC = overrides?.weatherOverrideEnabled ? overrides.temperatureC : 24;
+  const climateTemperatureC = outsideTemperatureC;
   const climateNeedsPreparation =
     climateTemperatureC !== null && (climateTemperatureC <= 10 || climateTemperatureC >= 30);
   const preconditioningEnabled = intent.preferences.includes("precondition_vehicle");
   const consumption = BASE_CONSUMPTION_KWH_PER_100KM * (outsideExtremeTemperature ? 1.15 : 1);
   const preconditioningKwh = preconditioningEnabled && climateNeedsPreparation ? 1.5 : 0;
   const energyUsedKwh = (totalDistanceM / 1000 / 100) * consumption + preconditioningKwh;
-  const batteryPercent = clamp(overrides?.enabled ? overrides.batteryPercent : 42, 0, 100);
+  const batteryPercent = clamp(
+    overrides?.batteryOverrideEnabled ? overrides.batteryPercent : 80,
+    0,
+    100,
+  );
   const estimatedArrivalBattery = clamp(
     Math.round((batteryPercent - (energyUsedKwh / BATTERY_CAPACITY_KWH) * 100) * 10) / 10,
     0,
     100,
   );
   const actions: ProactiveAction[] = [];
-  const temperatureLabel = overrides?.enabled ? "当前座舱" : "室外";
+  const temperatureLabel = overrides?.weatherOverrideEnabled ? "自定义气温" : "室外";
   if (preconditioningEnabled && climateTemperatureC !== null && climateTemperatureC <= 10) {
     const scheduled = new Date(departure.getTime() - 15 * 60 * 1000);
     actions.push(
@@ -228,7 +232,8 @@ export function buildTripPlan(
   if (constraints.length > 1) notes.push("已根据多个到达时间倒推各段最晚出发时间。 ");
   notes.push(...scheduleConflicts.map((message) => `时间约束冲突：${message}。`));
   if (!weather.available) notes.push("目标日期暂无可靠天气，未基于温度生成空调建议。 ");
-  if (weather.source === "override") notes.push("天气状况、座舱温度与车况使用 Demo Lab 演示数据；室外温度仍来自高德。 ");
+  if (weather.source === "override") notes.push("天气状况与气温使用本次对话的自定义场景。 ");
+  if (overrides?.batteryOverrideEnabled) notes.push("当前电量使用本次对话的自定义场景。 ");
 
   return {
     id: `trip-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -248,7 +253,7 @@ export function buildTripPlan(
       cabinTemperatureC,
       consumptionKwhPer100Km: consumption,
       batteryCapacityKwh: BATTERY_CAPACITY_KWH,
-      source: overrides?.enabled ? "override" : "mock",
+      source: overrides?.batteryOverrideEnabled ? "override" : "mock",
     },
     actions,
     notes,

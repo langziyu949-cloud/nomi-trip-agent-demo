@@ -2261,9 +2261,335 @@ select:focus-visible {
   margin-bottom: 16px;
 }
 
+.scenario-default-card {
+  padding: 12px 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid rgba(47, 117, 107, 0.14);
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(226, 243, 236, 0.82), rgba(255, 255, 255, 0.72));
+}
+
+.scenario-default-card > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.scenario-status-dot {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 9px;
+  background: var(--jade);
+  box-shadow: 0 7px 15px rgba(47, 117, 107, 0.18);
+}
+
+.scenario-status-dot::after {
+  content: "✓";
+  color: white;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.scenario-default-card strong,
+.scenario-default-card small {
+  display: block;
+}
+
+.scenario-default-card strong {
+  font-size: 11px;
+}
+
+.scenario-default-card small {
+  margin-top: 3px;
+  color: var(--ink-soft);
+  font-size: 8px;
+  line-height: 1.4;
+}
+
+.scenario-default-card em {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: rgba(47, 117, 107, 0.09);
+  color: var(--jade-deep);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 750;
+}
+
 .scenario-section .toggle-row {
   min-height: 58px;
   padding: 10px 11px;
+}
+
+.scenario-toggle {
+  background: rgba(248, 250, 246, 0.9);
+  cursor: pointer;
+}
+
+.scenario-toggle:has(input:checked) {
+  border-color: rgba(47, 117, 107, 0.24);
+  background: rgba(229, 243, 237, 0.72);
+}
+
+.scenario-options-grid {
+  margin-top: 8px;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  border: 1px solid rgba(47, 117, 107, 0.14);
+  border-radius: 13px;
+  background: rgba(238, 247, 243, 0.58);
+  animation: scenario-reveal 160ms ease-out;
+}
+
+@keyframes scenario-reveal {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.scenario-options-grid label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--ink-soft);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.scenario-options-grid select {
+  width: 100%;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  outline: none;
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--ink);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.scenario-options-grid select:focus {
+  border-color: rgba(47, 117, 107, 0.42);
+  box-shadow: 0 0 0 2px rgba(47, 117, 107, 0.08);
+}
+
+.scenario-range-card {
+  margin-top: 8px;
+  padding: 10px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid rgba(47, 117, 107, 0.14);
+  border-radius: 13px;
+  background: rgba(238, 247, 243, 0.58);
+  animation: scenario-reveal 160ms ease-out;
+}
+
+.scenario-range-card > span,
+.scenario-range-card > small {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.scenario-range-card strong {
+  font-size: 9px;
+}
+
+.scenario-range-card em {
+  color: var(--jade-deep);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.scenario-range-card input {
+  width: 100%;
+  accent-color: var(--jade);
+}
+
+.scenario-range-card > small {
+  color: var(--muted);
+  font-size: 7px;
+}
+
+.scenario-readonly-row {
+  min-height: 48px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(248, 250, 246, 0.78);
+}
+
+.scenario-readonly-row span {
+  color: var(--ink-soft);
+  font-size: 9px;
+}
+
+.scenario-readonly-row strong {
+  font-size: 10px;
+}
+
+.scenario-favorites {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  animation: scenario-reveal 160ms ease-out;
+}
+
+.scenario-favorite-card {
+  min-height: 58px;
+  padding: 9px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(238, 247, 243, 0.48);
+}
+
+.scenario-favorite-card > div:first-child {
+  min-width: 0;
+}
+
+.scenario-favorite-card span,
+.scenario-favorite-card strong,
+.scenario-favorite-card small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scenario-favorite-card span {
+  color: var(--jade);
+  font-size: 8px;
+  font-weight: 800;
+}
+
+.scenario-favorite-card strong {
+  margin-top: 2px;
+  font-size: 10px;
+}
+
+.scenario-favorite-card small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 7px;
+}
+
+.scenario-favorite-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+}
+
+.scenario-favorite-actions button,
+.scenario-add-favorite,
+.scenario-editor-cancel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--jade-deep);
+  font-size: 8px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.scenario-favorite-actions button {
+  min-height: 27px;
+  padding: 0 7px;
+}
+
+.scenario-favorite-actions button:last-child {
+  color: var(--muted);
+}
+
+.scenario-add-favorite {
+  width: 100%;
+  min-height: 34px;
+  border-style: dashed;
+}
+
+.scenario-empty-state {
+  margin-top: 8px;
+  padding: 12px;
+  border: 1px dashed var(--line);
+  border-radius: 11px;
+  color: var(--muted);
+  font-size: 8px;
+  text-align: center;
+}
+
+.scenario-place-editor {
+  margin-top: 0;
+}
+
+.favorite-label-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.favorite-label-options button {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: white;
+  color: var(--ink-soft);
+  font-size: 8px;
+  cursor: pointer;
+}
+
+.favorite-label-options button.is-selected {
+  border-color: var(--jade);
+  background: var(--jade);
+  color: white;
+}
+
+.favorite-label-options button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.favorite-custom-label {
+  width: 100%;
+  height: 34px;
+  margin-bottom: 7px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  outline: none;
+  background: white;
+  color: var(--ink);
+  font-size: 9px;
+}
+
+.scenario-editor-cancel {
+  width: 100%;
+  min-height: 30px;
+  margin-top: 7px;
+  color: var(--ink-soft);
 }
 
 .toggle-row.is-locked {

@@ -64,12 +64,19 @@ function planFor(draft = intent()) {
 }
 
 const demoSettings: DemoSettings = {
-  enabled: true,
+  weatherOverrideEnabled: true,
   condition: "小雪",
+  temperatureC: 8,
+  batteryOverrideEnabled: true,
   batteryPercent: 42,
-  cabinTemperatureC: 8,
   preconditionVehicle: true,
-  favoritePlaces: DEFAULT_PLACES,
+  favoritePlacesEnabled: true,
+  favoritePlaces: (Object.keys(DEFAULT_PLACES) as Array<keyof typeof DEFAULT_PLACES>).map((key) => ({
+    id: `favorite-${key}`,
+    key,
+    label: DEFAULT_PLACES[key].name,
+    place: DEFAULT_PLACES[key],
+  })),
 };
 
 describe("conversation domain", () => {

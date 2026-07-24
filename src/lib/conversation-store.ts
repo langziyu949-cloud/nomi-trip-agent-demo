@@ -12,6 +12,8 @@ import {
 } from "@/lib/conversation-turn";
 import type {
   DemoSettings,
+  FavoritePlaceKey,
+  ScenarioFavoritePlace,
   TripIntentDraft,
   TripPlan,
 } from "@/lib/types";
@@ -210,20 +212,24 @@ function isTripPlan(value: unknown): value is TripPlan {
   return TripPlanSchema.safeParse(value).success;
 }
 
-const FavoritePlacesSchema = z.object({
-  home: ResolvedPlaceSchema,
-  company: ResolvedPlaceSchema,
-  school: ResolvedPlaceSchema,
-  wifeCompany: ResolvedPlaceSchema,
+const FavoritePlaceKeySchema = z.enum(["home", "company", "school", "wifeCompany"]);
+
+const ScenarioFavoritePlaceSchema = z.object({
+  id: z.string().min(1),
+  key: FavoritePlaceKeySchema.nullable(),
+  label: z.string().min(1),
+  place: ResolvedPlaceSchema,
 }).strict();
 
 const DemoSettingsSchema = z.object({
-  enabled: z.boolean(),
+  weatherOverrideEnabled: z.boolean(),
   condition: z.string(),
+  temperatureC: z.number().finite(),
+  batteryOverrideEnabled: z.boolean(),
   batteryPercent: z.number().finite(),
-  cabinTemperatureC: z.number().finite(),
   preconditionVehicle: z.boolean(),
-  favoritePlaces: FavoritePlacesSchema,
+  favoritePlacesEnabled: z.boolean(),
+  favoritePlaces: z.array(ScenarioFavoritePlaceSchema),
 }).strict();
 
 function isDemoSettings(value: unknown): value is DemoSettings {
@@ -349,22 +355,62 @@ function mergeLegacyDemoSettings(
       "旧版 Demo Lab 数据格式无效，原数据已保留。",
     );
   }
-  const legacyTemperature = typeof value.temperatureC === "number" ? value.temperatureC : undefined;
-  const favoritePlaces = isRecord(value.favoritePlaces)
-    ? { ...(fallback?.favoritePlaces ?? {}), ...value.favoritePlaces }
-    : fallback?.favoritePlaces;
+  const favoriteLabels: Record<FavoritePlaceKey, string> = {
+    home: "家",
+    school: "学校",
+    company: "公司",
+    wifeCompany: "家人公司",
+  };
+  const favoriteKeys = Object.keys(favoriteLabels) as FavoritePlaceKey[];
+  let favoritePlaces: ScenarioFavoritePlace[] | undefined;
+  if (Array.isArray(value.favoritePlaces)) {
+    favoritePlaces = value.favoritePlaces as ScenarioFavoritePlace[];
+  } else if (isRecord(value.favoritePlaces)) {
+    favoritePlaces = favoriteKeys.flatMap((key) => {
+      const resolved = value.favoritePlaces;
+      const place = isRecord(resolved) ? resolved[key] : undefined;
+      return ResolvedPlaceSchema.safeParse(place).success
+        ? [{
+            id: `legacy-${key}`,
+            key,
+            label: favoriteLabels[key],
+            place,
+          } as ScenarioFavoritePlace]
+        : [];
+    });
+  } else {
+    favoritePlaces = fallback?.favoritePlaces;
+  }
+  const legacyEnabled = typeof value.enabled === "boolean" ? value.enabled : undefined;
+  const legacyTemperature = typeof value.cabinTemperatureC === "number"
+    ? value.cabinTemperatureC
+    : typeof value.temperatureC === "number"
+      ? value.temperatureC
+      : undefined;
   const candidate = {
-    enabled: typeof value.enabled === "boolean" ? value.enabled : fallback?.enabled,
+    weatherOverrideEnabled: typeof value.weatherOverrideEnabled === "boolean"
+      ? value.weatherOverrideEnabled
+      : legacyEnabled ?? fallback?.weatherOverrideEnabled,
     condition: typeof value.condition === "string" ? value.condition : fallback?.condition,
+    temperatureC: typeof value.temperatureC === "number"
+      ? value.temperatureC
+      : legacyTemperature ?? fallback?.temperatureC,
+    batteryOverrideEnabled: typeof value.batteryOverrideEnabled === "boolean"
+      ? value.batteryOverrideEnabled
+      : legacyEnabled !== undefined
+        ? true
+        : fallback?.batteryOverrideEnabled,
     batteryPercent: typeof value.batteryPercent === "number"
       ? value.batteryPercent
       : fallback?.batteryPercent,
-    cabinTemperatureC: typeof value.cabinTemperatureC === "number"
-      ? value.cabinTemperatureC
-      : legacyTemperature ?? fallback?.cabinTemperatureC,
     preconditionVehicle: typeof value.preconditionVehicle === "boolean"
       ? value.preconditionVehicle
       : fallback?.preconditionVehicle,
+    favoritePlacesEnabled: typeof value.favoritePlacesEnabled === "boolean"
+      ? value.favoritePlacesEnabled
+      : isRecord(value.favoritePlaces)
+        ? true
+        : fallback?.favoritePlacesEnabled,
     favoritePlaces,
   };
   if (!isDemoSettings(candidate)) {
@@ -375,6 +421,22 @@ function mergeLegacyDemoSettings(
     );
   }
   return cloneValue(candidate);
+}
+
+function normalizeStoredConversation(
+  value: unknown,
+  fallback: DemoSettings | null,
+): unknown {
+  if (!isRecord(value) || !isRecord(value.scenario)) return value;
+  const scenario = value.scenario;
+  if (scenario.demoSettings === null || scenario.demoSettings === undefined) return value;
+  return {
+    ...value,
+    scenario: {
+      ...scenario,
+      demoSettings: mergeLegacyDemoSettings(scenario.demoSettings, fallback),
+    },
+  };
 }
 
 export function readLegacyConversationSnapshot(storage: LegacyStorage): LegacyConversationSnapshot {
@@ -626,14 +688,20 @@ export class IndexedDbConversationStore implements ConversationPersistence {
       const transaction = database.transaction(CONVERSATIONS_STORE_NAME, "readonly");
       const request = transaction.objectStore(CONVERSATIONS_STORE_NAME).getAll();
       const [values] = await Promise.all([requestResult(request), transactionComplete(transaction)]);
-      if (!values.every(isConversation)) {
+      const normalized = values.map((value) => normalizeStoredConversation(
+        value,
+        this.defaultDemoSettings,
+      ));
+      if (!normalized.every(isConversation)) {
         throw new ConversationStoreError(
           "INVALID_DATA",
           "loadConversations",
           "历史记录数据已损坏，历史暂未加载。",
         );
       }
-      return sortConversationsByUpdatedAt(values.map((value) => cloneValue(value)));
+      return sortConversationsByUpdatedAt(
+        normalized.map((value) => cloneValue(value as Conversation)),
+      );
     } catch (error) {
       throw asStoreError(error, "READ_FAILED", "loadConversations", "无法读取历史记录，历史暂未加载。");
     }
@@ -646,14 +714,15 @@ export class IndexedDbConversationStore implements ConversationPersistence {
       const request = transaction.objectStore(CONVERSATIONS_STORE_NAME).get(id);
       const [value] = await Promise.all([requestResult(request), transactionComplete(transaction)]);
       if (value === undefined) return null;
-      if (!isConversation(value)) {
+      const normalized = normalizeStoredConversation(value, this.defaultDemoSettings);
+      if (!isConversation(normalized)) {
         throw new ConversationStoreError(
           "INVALID_DATA",
           "loadConversation",
           "该历史记录数据已损坏，暂时无法加载。",
         );
       }
-      return cloneValue(value);
+      return cloneValue(normalized);
     } catch (error) {
       throw asStoreError(error, "READ_FAILED", "loadConversation", "无法读取历史记录，历史暂未加载。");
     }

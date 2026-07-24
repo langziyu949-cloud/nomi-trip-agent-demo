@@ -260,12 +260,12 @@ describe("MiniMaxTripNarrator", () => {
     expect(narration.text).toContain("11:55 到我的公司");
   });
 
-  it("微信模板简洁覆盖关键时间、全部准备和人工提醒，并区分座舱与室外温度", () => {
+  it("微信模板简洁覆盖关键时间、全部准备和自定义天气提醒", () => {
     const plan = makePlan();
     plan.weather = {
       ...plan.weather,
       condition: "小雨",
-      temperatureC: 37,
+      temperatureC: 8,
       source: "override",
     };
     plan.vehicle.cabinTemperatureC = 8;
@@ -288,7 +288,7 @@ describe("MiniMaxTripNarrator", () => {
       },
     ];
     plan.actions = [
-      { id: "preheat", type: "PREHEAT", title: "提前温暖座舱", detail: "当前座舱 8°C，将在出发前开启暖风。", scheduledAt: null, severity: "suggestion" },
+      { id: "preheat", type: "PREHEAT", title: "提前温暖座舱", detail: "自定义气温 8°C，将在出发前开启暖风。", scheduledAt: null, severity: "suggestion" },
       { id: "seat", type: "SEAT_HEAT", title: "开启座椅加热", detail: "将在出发前开启。", scheduledAt: null, severity: "info" },
       { id: "defog", type: "DEFOG", title: "准备除雾", detail: "将在出发前开启前挡除雾。", scheduledAt: null, severity: "suggestion" },
       { id: "umbrella", type: "UMBRELLA", title: "别忘了雨具", detail: "已加入雨具提醒。", scheduledAt: null, severity: "info" },
@@ -298,11 +298,10 @@ describe("MiniMaxTripNarrator", () => {
     const text = buildTemplateNarration(plan).text;
     expect(text).toContain("11:12");
     expect(text).toContain("11:55");
-    expect(text).toContain("当前座舱 8°C");
+    expect(text).toContain("自定义气温 8°C");
     expect(text).toContain("我会提前温暖座舱、开启座椅加热、准备除雾");
     expect(text).toContain("小雨，记得带雨具");
     expect(text).toContain("5 分钟路况缓冲");
-    expect(text).not.toContain("37°C");
     expect(text).not.toContain("建议提前温暖座舱");
     expect(text.length).toBeLessThanOrEqual(180);
   });

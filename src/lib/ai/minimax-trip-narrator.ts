@@ -323,7 +323,7 @@ function validateTypedQuantities(text: string, facts: NarrationFacts): void {
     const context = text.slice(Math.max(0, index - 12), Math.min(text.length, index + match[0].length + 8));
     const allowed = /座舱|车内|舱内/.test(context)
       ? [facts.vehicle.cabinTemperatureC]
-      : /室外|气温|天气|外面/.test(context)
+      : /室外|气温|天气|外面|自定义/.test(context)
         ? [facts.weather.temperatureC]
         : [facts.vehicle.cabinTemperatureC, facts.weather.temperatureC];
     if (!allowed.some((candidate) => candidate !== null && candidate === value)) {
@@ -378,9 +378,11 @@ function validateNarration(
   );
   const mentionsClimateAction = /暖舱|温暖座舱|预热|清凉座舱|制冷|降温/.test(text);
   if (hasClimateAction && mentionsClimateAction && facts.weather.source === "override" && (
-    !text.includes(String(facts.vehicle.cabinTemperatureC)) || !text.includes("座舱")
+    facts.weather.temperatureC === null
+    || !text.includes(String(facts.weather.temperatureC))
+    || !/气温|天气|室外|外面|自定义/.test(text)
   )) {
-    throw new Error("温控动作必须说明座舱温度");
+    throw new Error("温控动作必须准确说明自定义气温");
   }
   if (
     facts.weather.source === "override" &&

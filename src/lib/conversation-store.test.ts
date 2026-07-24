@@ -58,12 +58,19 @@ function makePlan(intent = makeIntent()) {
 }
 
 const settings: DemoSettings = {
-  enabled: true,
+  weatherOverrideEnabled: true,
   condition: "小雪",
+  temperatureC: 8,
+  batteryOverrideEnabled: true,
   batteryPercent: 42,
-  cabinTemperatureC: 8,
   preconditionVehicle: true,
-  favoritePlaces: DEFAULT_PLACES,
+  favoritePlacesEnabled: true,
+  favoritePlaces: (Object.keys(DEFAULT_PLACES) as Array<keyof typeof DEFAULT_PLACES>).map((key) => ({
+    id: `favorite-${key}`,
+    key,
+    label: DEFAULT_PLACES[key].name,
+    place: DEFAULT_PLACES[key],
+  })),
 };
 
 function makePersistedConversation(): Conversation {
@@ -138,12 +145,9 @@ describe("MemoryConversationStore", () => {
     });
   });
 
-  it("rejects Demo Lab settings when any required favorite place is missing", async () => {
+  it("rejects Demo Lab settings when a configured favorite place is malformed", async () => {
     const conversation = makePersistedConversation();
-    const favorites = conversation.scenario.demoSettings!.favoritePlaces as Partial<
-      DemoSettings["favoritePlaces"]
-    >;
-    delete favorites.school;
+    conversation.scenario.demoSettings!.favoritePlaces[0].label = "";
 
     expect(isConversation(conversation)).toBe(false);
     await expect(createMemoryConversationStore().saveConversation(conversation)).rejects.toMatchObject({
@@ -187,11 +191,36 @@ describe("legacy localStorage migration helpers", () => {
       scenario: {
         ready: true,
         lockedAt: timestamp,
-        demoSettings: { condition: "小雪", cabinTemperatureC: 8 },
+        demoSettings: { condition: "小雪", temperatureC: 8 },
       },
     });
     expect(conversation?.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(conversation?.messages[1]).toMatchObject({ kind: "plan", planId: plan.id });
+  });
+
+  it("upgrades the old combined Demo Lab switch into independent scene settings", () => {
+    const legacySettings = {
+      enabled: false,
+      condition: "小雪",
+      batteryPercent: 42,
+      cabinTemperatureC: 8,
+      preconditionVehicle: true,
+      favoritePlaces: DEFAULT_PLACES,
+    };
+    const conversation = buildLegacyConversation({
+      intentJson: JSON.stringify(makeIntent()),
+      planJson: null,
+      demoSettingsJson: JSON.stringify(legacySettings),
+    }, { now: timestamp, defaultDemoSettings: settings });
+
+    expect(conversation?.scenario.demoSettings).toMatchObject({
+      weatherOverrideEnabled: false,
+      temperatureC: 8,
+      batteryOverrideEnabled: true,
+      batteryPercent: 42,
+      favoritePlacesEnabled: true,
+    });
+    expect(conversation?.scenario.demoSettings?.favoritePlaces).toHaveLength(4);
   });
 
   it("uses caller defaults when the legacy trip had no override key", () => {
