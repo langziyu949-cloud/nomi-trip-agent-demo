@@ -79,19 +79,29 @@ export const MiniMaxRawIntentSchema = z.object({
 export type MiniMaxRawIntent = z.infer<typeof MiniMaxRawIntentSchema>;
 
 export const TripPlanNarrationRequestSchema = z.object({
+  userText: z.string().trim().min(1).max(2_000).optional(),
+  mode: z.enum(["initial", "update"]).optional(),
   plan: z.object({
     intent: z.object({
       date: CalendarDateSchema,
       origin: z.object({
+        label: z.string().min(1).max(80),
         query: z.string().min(1),
         resolved: z.object({ name: z.string().min(1) }).passthrough().nullable(),
       }).passthrough(),
+      stops: z.array(z.object({
+        label: z.string().min(1).max(80),
+        query: z.string().min(1).max(80),
+      }).passthrough()).min(1).max(3),
+      timeConstraint: MiniMaxRawTimeConstraintSchema,
+      timeConstraints: z.array(MiniMaxRawTimeConstraintSchema).min(1).max(3).optional(),
     }).passthrough(),
     departureTime: ClockTimeSchema,
     planningBufferSec: z.number().int().min(0),
     stops: z.array(z.object({
       place: z.object({ name: z.string().min(1) }).passthrough(),
       eta: ClockTimeSchema,
+      dateTime: z.string().datetime({ offset: true }),
       departureTime: ClockTimeSchema.nullable().optional(),
       dwellSec: z.number().int().min(0),
     }).passthrough()).min(1).max(3),

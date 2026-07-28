@@ -14,10 +14,11 @@ const RequestSchema = z.object({
     timeConstraint: z.object({ type: z.enum(["ARRIVE_BY", "DEPART_AT"]), time: z.string(), targetStopIndex: z.number() }).passthrough(),
   }).passthrough(),
   overrides: z.object({
-    enabled: z.boolean(),
+    weatherOverrideEnabled: z.boolean(),
     condition: z.string(),
+    temperatureC: z.number(),
+    batteryOverrideEnabled: z.boolean(),
     batteryPercent: z.number(),
-    cabinTemperatureC: z.number(),
   }).optional(),
 });
 

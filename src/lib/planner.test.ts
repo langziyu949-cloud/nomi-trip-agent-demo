@@ -67,6 +67,26 @@ describe("buildTripPlan", () => {
     expect(plan.stops[1].eta).toBe("07:55");
   });
 
+  it("多站行程的首站截止时间会保留必要缓冲并尽量晚出发", () => {
+    const intent = makeIntent("ARRIVE_BY");
+    intent.stops = [favoriteDraft("school"), favoriteDraft("wifeCompany"), favoriteDraft("company")];
+    intent.timeConstraints = [
+      { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+    ];
+    intent.timeConstraint = intent.timeConstraints[0];
+    const threeLegs = [
+      makeLeg("home", "school", 29 * 60, 10_000),
+      makeLeg("school", "wifeCompany", 23 * 60, 9_000),
+      makeLeg("wifeCompany", "company", 19 * 60, 8_000),
+    ];
+
+    const plan = buildTripPlan(intent, threeLegs, normalWeather);
+
+    expect(plan.planningBufferSec).toBe(5 * 60);
+    expect(plan.departureTime).toBe("07:26");
+    expect(plan.stops.map((stop) => stop.eta)).toEqual(["07:55", "08:23", "08:47"]);
+  });
+
   it("多个到达约束会倒推出途经点的最晚出发时间", () => {
     const intent = makeIntent("ARRIVE_BY");
     intent.timeConstraints = [
@@ -100,34 +120,37 @@ describe("buildTripPlan", () => {
     expect(types).toEqual(expect.arrayContaining(["PREHEAT", "SEAT_HEAT", "DEFOG", "UMBRELLA"]));
   });
 
-  it("演示场景使用座舱温度触发预热，不覆盖高德室外温度", () => {
+  it("自定义天气会覆盖天气与气温并触发预热", () => {
     const plan = buildTripPlan(makeIntent(), legs, normalWeather, {
-      enabled: true,
+      weatherOverrideEnabled: true,
       condition: "小雪",
+      temperatureC: -5,
+      batteryOverrideEnabled: false,
       batteryPercent: 42,
-      cabinTemperatureC: -5,
     });
-    expect(plan.weather.temperatureC).toBe(24);
+    expect(plan.weather.temperatureC).toBe(-5);
     expect(plan.actions.some((item) => item.type === "PREHEAT")).toBe(true);
-    expect(plan.actions.find((item) => item.type === "PREHEAT")?.detail).toContain("当前座舱 -5°C");
+    expect(plan.actions.find((item) => item.type === "PREHEAT")?.detail).toContain("自定义气温 -5°C");
   });
 
-  it("炎热座舱触发制冷，关闭主动备车时不触发温控动作", () => {
+  it("炎热天气触发制冷，关闭主动备车时不触发温控动作", () => {
     const hotPlan = buildTripPlan(makeIntent(), legs, normalWeather, {
-      enabled: true,
+      weatherOverrideEnabled: true,
       condition: "晴",
+      temperatureC: 35,
+      batteryOverrideEnabled: false,
       batteryPercent: 42,
-      cabinTemperatureC: 35,
     });
     expect(hotPlan.actions.some((item) => item.type === "PRECOOL")).toBe(true);
 
     const disabledIntent = makeIntent();
     disabledIntent.preferences = [];
     const disabledPlan = buildTripPlan(disabledIntent, legs, normalWeather, {
-      enabled: true,
+      weatherOverrideEnabled: true,
       condition: "晴",
+      temperatureC: -5,
+      batteryOverrideEnabled: false,
       batteryPercent: 42,
-      cabinTemperatureC: -5,
     });
     expect(disabledPlan.actions.some((item) => ["PREHEAT", "PRECOOL", "SEAT_HEAT"].includes(item.type))).toBe(false);
   });
@@ -138,12 +161,25 @@ describe("buildTripPlan", () => {
       makeLeg("school", "company", 30 * 60, 40_000),
     ];
     const plan = buildTripPlan(makeIntent(), longLegs, normalWeather, {
-      enabled: true,
+      weatherOverrideEnabled: false,
       condition: "晴",
+      temperatureC: 20,
+      batteryOverrideEnabled: true,
       batteryPercent: 25,
-      cabinTemperatureC: 5,
     });
     expect(plan.vehicle.estimatedArrivalBattery).toBeLessThan(10);
     expect(plan.actions.some((item) => item.type === "ENERGY_CRITICAL")).toBe(true);
+  });
+
+  it("未自定义电量时默认从 80% 计算", () => {
+    const plan = buildTripPlan(makeIntent(), legs, normalWeather, {
+      weatherOverrideEnabled: false,
+      condition: "晴",
+      temperatureC: 20,
+      batteryOverrideEnabled: false,
+      batteryPercent: 15,
+    });
+
+    expect(plan.vehicle.batteryPercent).toBe(80);
   });
 });

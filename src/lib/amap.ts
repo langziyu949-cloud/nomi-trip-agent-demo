@@ -1,4 +1,5 @@
 import { addCalendarDays, todayInShanghai } from "@/lib/date-utils";
+import { getAmapBrowserConfig } from "@/lib/amap-browser-config";
 import type {
   Coordinates,
   ResolvedPlace,
@@ -273,9 +274,10 @@ export async function getWeather(
 }
 
 export function providerHealth() {
+  const browserConfig = getAmapBrowserConfig();
   return {
     amapWebService: Boolean(process.env.AMAP_WEB_SERVICE_KEY),
-    amapJsApi: Boolean(process.env.NEXT_PUBLIC_AMAP_JS_KEY),
-    amapSecurityCode: Boolean(process.env.NEXT_PUBLIC_AMAP_SECURITY_CODE),
+    amapJsApi: Boolean(browserConfig?.key),
+    amapSecurityCode: Boolean(browserConfig?.securityJsCode),
   };
 }

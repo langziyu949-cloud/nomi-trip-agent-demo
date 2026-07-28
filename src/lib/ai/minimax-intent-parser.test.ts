@@ -50,6 +50,7 @@ describe("MiniMaxIntentParser", () => {
     expect(intent.stops.map((stop) => stop.resolved?.name)).toEqual(["儿子学校", "我的公司"]);
     expect(intent.understanding).toEqual({ provider: "minimax", model: "MiniMax-Test", fallback: false });
     expect(client.requests[0].messages[0].content).toContain("# NOMI 行程理解规范");
+    expect(client.requests[0].messages[0].content).toContain("targetStopIndex` 一律使用从 0 开始的下标");
     expect(client.requests[0].temperature).toBe(0);
   });
 
@@ -151,6 +152,68 @@ describe("MiniMaxIntentParser", () => {
       targetStopIndex: 0,
       inferred: true,
     });
+    expect(client.requests).toHaveLength(1);
+  });
+
+  it("模型少保留明确时刻时会要求重试并恢复全部约束", async () => {
+    const stops = [
+      { kind: "QUERY", favoriteKey: null, query: "星河展馆" },
+      { kind: "QUERY", favoriteKey: null, query: "虹桥机场" },
+      { kind: "QUERY", favoriteKey: null, query: "北辰大厦" },
+    ];
+    const incomplete = intentJson({
+      stops,
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+        { type: "ARRIVE_BY", time: "09:00", targetStopIndex: 1, inferred: false },
+      ],
+    });
+    const complete = intentJson({
+      stops,
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+        { type: "ARRIVE_BY", time: "09:00", targetStopIndex: 1, inferred: false },
+        { type: "ARRIVE_BY", time: "10:00", targetStopIndex: 2, inferred: false },
+      ],
+    });
+    const client = new ScriptedClient([incomplete, complete]);
+
+    const intent = await new MiniMaxIntentParser(client).parse(
+      "明天第一站八点前到，第二站九点前到，第三站十点前到",
+    );
+
+    expect(client.requests).toHaveLength(2);
+    expect(intent.timeConstraints).toHaveLength(3);
+  });
+
+  it("模型额外生成明确时刻时会要求重试并移除多余约束", async () => {
+    const stops = [
+      { kind: "QUERY", favoriteKey: null, query: "星河展馆" },
+      { kind: "QUERY", favoriteKey: null, query: "虹桥机场" },
+    ];
+    const excessive = intentJson({
+      stops,
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+        { type: "ARRIVE_BY", time: "09:00", targetStopIndex: 1, inferred: false },
+        { type: "ARRIVE_BY", time: "10:00", targetStopIndex: 1, inferred: false },
+      ],
+    });
+    const repaired = intentJson({
+      stops,
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+        { type: "ARRIVE_BY", time: "09:00", targetStopIndex: 1, inferred: false },
+      ],
+    });
+    const client = new ScriptedClient([excessive, repaired]);
+
+    const intent = await new MiniMaxIntentParser(client).parse(
+      "明天第一站八点前到，第二站九点前到",
+    );
+
+    expect(client.requests).toHaveLength(2);
+    expect(intent.timeConstraints).toHaveLength(2);
   });
 
   it("保留多个明确时间并分别绑定对应站点", async () => {
@@ -213,6 +276,90 @@ describe("MiniMaxIntentParser", () => {
 
     const intent = await new MiniMaxIntentParser(client).parse(
       "明天早上我要10点之前到东方明珠，然后12点去接儿子放学",
+    );
+
+    expect(intent.timeConstraints?.map((constraint) => constraint.targetStopIndex)).toEqual([0, 1]);
+  });
+
+  it("明确时刻语句唯一指向某站时会泛化修正模型的错误下标", async () => {
+    const client = new ScriptedClient([intentJson({
+      stops: [
+        { kind: "QUERY", favoriteKey: null, query: "星河展馆" },
+        { kind: "QUERY", favoriteKey: null, query: "虹桥机场" },
+        { kind: "QUERY", favoriteKey: null, query: "北辰大厦" },
+      ],
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 1, inferred: false },
+      ],
+      issues: [],
+    })]);
+
+    const intent = await new MiniMaxIntentParser(client).parse(
+      "明天先去星河展馆，再去虹桥机场，最后去北辰大厦，星河这边要八点前到展馆",
+    );
+
+    expect(intent.stops.map((stop) => stop.query)).toEqual(["星河展馆", "虹桥机场", "北辰大厦"]);
+    expect(intent.timeConstraints).toEqual([
+      { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+    ]);
+  });
+
+  it.each([2, 3])("%i 站行程会将自然语言第一站映射为零基下标", async (stopCount) => {
+    const allStops = [
+      { kind: "QUERY", favoriteKey: null, query: "星河展馆" },
+      { kind: "QUERY", favoriteKey: null, query: "虹桥机场" },
+      { kind: "QUERY", favoriteKey: null, query: "北辰大厦" },
+    ];
+    const client = new ScriptedClient([intentJson({
+      stops: allStops.slice(0, stopCount),
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 1, inferred: false },
+      ],
+    })]);
+
+    const intent = await new MiniMaxIntentParser(client).parse(
+      "明天先安排几个目的地，第一站要八点前到",
+    );
+
+    expect(intent.timeConstraints?.[0].targetStopIndex).toBe(0);
+  });
+
+  it("约束按规范化时刻匹配分句，不依赖模型数组顺序", async () => {
+    const client = new ScriptedClient([intentJson({
+      stops: [
+        { kind: "QUERY", favoriteKey: null, query: "星河展馆" },
+        { kind: "QUERY", favoriteKey: null, query: "虹桥机场" },
+      ],
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "12:00", targetStopIndex: 0, inferred: false },
+        { type: "ARRIVE_BY", time: "10:00", targetStopIndex: 1, inferred: false },
+      ],
+    })]);
+
+    const intent = await new MiniMaxIntentParser(client).parse(
+      "明天十点前到星河展馆，十二点前到虹桥机场",
+    );
+
+    expect(intent.timeConstraints).toEqual([
+      { type: "ARRIVE_BY", time: "12:00", targetStopIndex: 1, inferred: false },
+      { type: "ARRIVE_BY", time: "10:00", targetStopIndex: 0, inferred: false },
+    ]);
+  });
+
+  it("重复时刻按规范要求的叙述顺序绑定，不保留交叉下标", async () => {
+    const client = new ScriptedClient([intentJson({
+      stops: [
+        { kind: "QUERY", favoriteKey: null, query: "星河展馆" },
+        { kind: "QUERY", favoriteKey: null, query: "虹桥机场" },
+      ],
+      timeConstraints: [
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 1, inferred: false },
+        { type: "ARRIVE_BY", time: "08:00", targetStopIndex: 0, inferred: false },
+      ],
+    })]);
+
+    const intent = await new MiniMaxIntentParser(client).parse(
+      "明天第一站八点前到，第二站也要八点前到",
     );
 
     expect(intent.timeConstraints?.map((constraint) => constraint.targetStopIndex)).toEqual([0, 1]);

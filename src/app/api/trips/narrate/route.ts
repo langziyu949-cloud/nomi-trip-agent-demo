@@ -17,8 +17,9 @@ export async function POST(request: Request) {
   }
 
   const plan = (body as { plan: TripPlan }).plan;
+  const context = { userText: parsed.data.userText, mode: parsed.data.mode };
   try {
-    return NextResponse.json(await createConfiguredTripNarrator().narrate(plan));
+    return NextResponse.json(await createConfiguredTripNarrator().narrate(plan, context));
   } catch (error) {
     const errorCode = error instanceof MiniMaxError ? error.code : "NARRATION_UNKNOWN";
     const fallbackReason = error instanceof Error ? error.message.slice(0, 200) : "生成总结时发生未知错误。";
@@ -26,6 +27,7 @@ export async function POST(request: Request) {
       fallback: true,
       errorCode,
       fallbackReason,
+      context,
     }));
   }
 }
